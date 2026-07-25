@@ -15,10 +15,7 @@
 import pg from 'pg';
 import { DEFAULT_PG_CONFIG } from 'aidcp-kernel/kernel/pg-config.js';
 import { writeWithMirrorBump, type MirrorVersionBumper } from './mirror-version-store.js';
-import {
-  DEFAULT_HOT_LEAD_GATE_CONFIG,
-  type HotLeadGateConfig,
-} from '../hot-lead/heat-velocity.js';
+import { DEFAULT_HOT_LEAD_GATE_CONFIG, type HotLeadGateConfig } from 'aidcp-kernel/kernel/hot-lead-gate-config.js';
 import type { SchemaEnsurer } from 'aidcp-kernel/kernel/schema-capability-contract.js';
 
 const { Pool } = pg;

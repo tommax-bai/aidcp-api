@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import pg from 'pg';
 import { resolveEnvPgConfig } from 'aidcp-kernel/kernel/pg-config.js';
-import { normalizeReplyProfile, validateReplyConfig } from './reply-config.js';
+import { normalizeReplyProfile } from './reply-config.js';
+import { validateReplyConfig } from 'aidcp-kernel/kernel/interaction-reply-contract.js';
 import {
   DEFAULT_REPLY_POLICY,
   INTERACTION_PLATFORM,

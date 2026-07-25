@@ -17,7 +17,7 @@ import type { Soul } from 'aidcp-kernel/kernel/soul-types.js';
 import type { CuratedContentTypeFilter, CuratedSelectItem } from 'aidcp-kernel/kernel/curated-content-types.js';
 import type { ContentScheduleApprovalMode } from 'aidcp-kernel/kernel/content-schedule-mode.js';
 import type { PersonaBinding } from 'aidcp-kernel/kernel/persona-binding.js';
-import { PERSONA_UNAVAILABLE_REASON } from '../config/mirror-stop-work.js';
+import { PERSONA_UNAVAILABLE_REASON } from 'aidcp-kernel/kernel/config-stop-work-reasons.js';
 import type { PlatformId } from 'aidcp-kernel/kernel/platform-types.js';
 import { referenceImagesForGeneration, REFERENCE_IMAGE_MAX_COUNT } from 'aidcp-kernel/kernel/reference-image-guidance.js';
 import { shanghaiDayStartMs } from 'aidcp-kernel/time/shanghai-day.js';
