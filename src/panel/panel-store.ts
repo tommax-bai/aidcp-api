@@ -21,7 +21,7 @@ import {
   type RiskAction,
   type RiskStatus,
   type RiskQuotaLevel,
-} from '../risk/index.js';
+} from 'aidcp-kernel/kernel/risk-contract.js';
 import type { FeedAction } from 'aidcp-kernel/kernel/feed-action.js';
 import type { AlertSeverity } from '../feishu/types.js';
 import type { VisualReferenceAudit } from 'aidcp-kernel/kernel/visual-reference-types.js';
