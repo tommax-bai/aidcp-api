@@ -13,7 +13,7 @@ import pg from 'pg';
 import { RETIRED_ACCOUNT_ID } from 'aidcp-kernel/kernel/account-identity.js';
 import { DEFAULT_PG_CONFIG } from 'aidcp-kernel/kernel/pg-config.js';
 import { writeWithMirrorBump, type MirrorVersionBumper } from './config/mirror-version-store.js';
-import { normalizePlatformId, type PlatformId } from './platform/index.js';
+import { normalizePlatformId, type PlatformId } from 'aidcp-kernel/kernel/platform-types.js';
 import { parseDeploymentTarget, type DeploymentTarget } from 'aidcp-kernel/deployment-target.js';
 import type { ClaimExecutionTargetResult } from 'aidcp-kernel/kernel/account-ownership-port.js';
 import {
