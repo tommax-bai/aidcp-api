@@ -13,10 +13,10 @@
  */
 
 import pg from 'pg';
-import { DEFAULT_PG_CONFIG } from '../kernel/pg-config.js';
+import { DEFAULT_PG_CONFIG } from 'aidcp-kernel/kernel/pg-config.js';
 import { writeWithMirrorBump, type MirrorVersionBumper } from './mirror-version-store.js';
 import { RETIRED_ACCOUNT_ID } from '../account-store.js';
-import type { SchemaEnsurer } from '../kernel/schema-capability-contract.js';
+import type { SchemaEnsurer } from 'aidcp-kernel/kernel/schema-capability-contract.js';
 
 const { Pool } = pg;
 
@@ -27,7 +27,7 @@ import type {
   FacebookContainer,
   FacebookCommentMode,
   EffectiveFacebookCommentConfig,
-} from '../kernel/facebook-comment-config-types.js';
+} from 'aidcp-kernel/kernel/facebook-comment-config-types.js';
 export type { FacebookContainer, FacebookCommentMode, EffectiveFacebookCommentConfig };
 
 /** 每账号配置行（面板回显用）。keywords 为字符串数组；containers 为 legacy {url,name} 数组。 */

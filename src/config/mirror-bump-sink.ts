@@ -23,7 +23,7 @@ import type {
   ConfigMirrorBumpResult,
   ConfigMirrorBumpSink,
   ConfigMirrorKey,
-} from '../kernel/config-mirror-bump-types.js';
+} from 'aidcp-kernel/kernel/config-mirror-bump-types.js';
 import { CONFIG_MIRRORS } from './mirror-registry.js';
 import type { MirrorVersionStore } from './mirror-version-store.js';
 

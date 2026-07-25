@@ -7,7 +7,7 @@
  * 模块级 `WRITING_LANGUAGE_SET`（`new Set(...)` 被门禁 §4.7 判为「进程内活状态」故不入 kernel），并对
  * kernel 段等值再导出，既有导入方无感、行为逐字不变。
  */
-import type { WritingLanguage } from '../kernel/soul-types.js';
+import type { WritingLanguage } from 'aidcp-kernel/kernel/soul-types.js';
 
 export const WRITING_LANGUAGE_VALUES = ['zh-CN', 'en', 'vi'] as const satisfies readonly WritingLanguage[];
 const WRITING_LANGUAGE_SET = new Set<string>(WRITING_LANGUAGE_VALUES);
@@ -21,4 +21,4 @@ export {
   writingLanguageInstruction,
   writingLanguageLabel,
   type WritingLanguageCheck,
-} from '../kernel/writing-language.js';
+} from 'aidcp-kernel/kernel/writing-language.js';

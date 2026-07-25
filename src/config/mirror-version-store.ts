@@ -16,7 +16,7 @@
 
 import type pg from 'pg';
 import type { ConfigMirrorKey } from '../config-mirror-freshness.js';
-import type { MirrorQueryable, MirrorVersionBumper } from '../kernel/config-mirror-bump-types.js';
+import type { MirrorQueryable, MirrorVersionBumper } from 'aidcp-kernel/kernel/config-mirror-bump-types.js';
 import { CONFIG_MIRRORS } from './mirror-registry.js';
 
 /**
@@ -24,14 +24,14 @@ import { CONFIG_MIRRORS } from './mirror-registry.js';
  * （automation 侧的四个限频配置 store 也要用它们，留在 api 属主域会造出跨域 import）。
  * 本模块等值再导出，api 侧全部既有 import 路径逐字不变。
  */
-export { writeWithMirrorBump, CONFIG_MIRROR_BUMP_TOPIC } from '../kernel/config-mirror-bump-types.js';
+export { writeWithMirrorBump, CONFIG_MIRROR_BUMP_TOPIC } from 'aidcp-kernel/kernel/config-mirror-bump-types.js';
 export type {
   MirrorQueryable,
   MirrorVersionBumper,
   ConfigMirrorBumpRequest,
   ConfigMirrorBumpResult,
   ConfigMirrorBumpSink,
-} from '../kernel/config-mirror-bump-types.js';
+} from 'aidcp-kernel/kernel/config-mirror-bump-types.js';
 
 export const CONFIG_MIRROR_VERSION_SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS config_mirror_version (

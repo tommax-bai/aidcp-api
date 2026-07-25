@@ -14,18 +14,18 @@
  */
 
 import pg from 'pg';
-import { DEFAULT_PG_CONFIG } from '../kernel/pg-config.js';
-import { SHANGHAI_DAY_START_SQL } from '../time/shanghai-day.js';
+import { DEFAULT_PG_CONFIG } from 'aidcp-kernel/kernel/pg-config.js';
+import { SHANGHAI_DAY_START_SQL } from 'aidcp-kernel/time/shanghai-day.js';
 import {
   RISK_ACTIONS,
   type RiskAction,
   type RiskStatus,
   type RiskQuotaLevel,
 } from '../risk/index.js';
-import type { FeedAction } from '../kernel/feed-action.js';
+import type { FeedAction } from 'aidcp-kernel/kernel/feed-action.js';
 import type { AlertSeverity } from '../feishu/types.js';
-import type { VisualReferenceAudit } from '../kernel/visual-reference-types.js';
-import type { PanelAutomationReader, PanelRiskStateProjection } from '../kernel/panel-automation-types.js';
+import type { VisualReferenceAudit } from 'aidcp-kernel/kernel/visual-reference-types.js';
+import type { PanelAutomationReader, PanelRiskStateProjection } from 'aidcp-kernel/kernel/panel-automation-types.js';
 import {
   resolveAccountDisplayName,
   type AccountDisplayNameSource,

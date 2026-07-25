@@ -18,7 +18,7 @@
  * （拆库后即跨库事务，端口解决不了），故改最终一致：automation 入队 → 中继在 api 池上调本方法幂等落地。
  */
 import type pg from 'pg';
-import type { InteractionAuditEventRecord } from '../kernel/interaction-audit-outbox.js';
+import type { InteractionAuditEventRecord } from 'aidcp-kernel/kernel/interaction-audit-outbox.js';
 
 type Queryable = Pick<pg.Pool, 'query'> | Pick<pg.PoolClient, 'query'>;
 

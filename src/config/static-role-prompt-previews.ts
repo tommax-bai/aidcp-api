@@ -1,22 +1,22 @@
 // 全部 prompt 构建符号均从 kernel 直接导入：纯构建段已抬入 kernel（change decouple-behavior-class-ports），
 // 各业务角色文件从 kernel 等值再导出、运行时行为逐字不变；本 api 侧预览直连 kernel 以消去跨边界依赖。
-import { buildFacebookGroupJoinJudgePrompt } from '../kernel/facebook-group-join-prompt.js';
-import { buildFacebookCommentComposerPrompt } from '../kernel/facebook-comment-composer-prompt.js';
-import { buildInteractionReplyPrompt } from '../kernel/interaction-reply-prompt.js';
+import { buildFacebookGroupJoinJudgePrompt } from 'aidcp-kernel/kernel/facebook-group-join-prompt.js';
+import { buildFacebookCommentComposerPrompt } from 'aidcp-kernel/kernel/facebook-comment-composer-prompt.js';
+import { buildInteractionReplyPrompt } from 'aidcp-kernel/kernel/interaction-reply-prompt.js';
 import type {
   IntentClassifierInput,
   MinimalInbound,
   PolisherInput,
   RiskReviewerInput,
-} from '../kernel/interaction-types.js';
-import type { Soul } from '../kernel/soul-types.js';
-import { buildCoverFormSensePrompt } from '../kernel/cover-form-sense-prompt.js';
-import { buildCoverCardCopyPrompt } from '../kernel/cover-card-copy-prompt.js';
-import { buildVisualFidelityAuditPrompt } from '../kernel/visual-fidelity-audit-prompt.js';
+} from 'aidcp-kernel/kernel/interaction-types.js';
+import type { Soul } from 'aidcp-kernel/kernel/soul-types.js';
+import { buildCoverFormSensePrompt } from 'aidcp-kernel/kernel/cover-form-sense-prompt.js';
+import { buildCoverCardCopyPrompt } from 'aidcp-kernel/kernel/cover-card-copy-prompt.js';
+import { buildVisualFidelityAuditPrompt } from 'aidcp-kernel/kernel/visual-fidelity-audit-prompt.js';
 import {
   buildVisualReferenceSetPrompt,
   buildVisualReferenceSpecialistPrompt,
-} from '../kernel/visual-reference-prompts.js';
+} from 'aidcp-kernel/kernel/visual-reference-prompts.js';
 
 export interface StaticRolePromptPreview {
   build: (soul?: Soul) => string;

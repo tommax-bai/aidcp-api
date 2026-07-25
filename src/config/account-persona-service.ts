@@ -1,11 +1,11 @@
 import type { PersonaGenerator } from '../agents/persona-generator.js';
 import type { PanelPersonaConfig } from '../panel/types.js';
-import type { PersonaBinding } from '../kernel/persona-binding.js';
+import type { PersonaBinding } from 'aidcp-kernel/kernel/persona-binding.js';
 import { normalizePlatformId } from '../platform/index.js';
 import { loadSoulFromYaml } from '../soul/index.js';
-import { resolveLikeAffinity } from '../kernel/like-affinity.js';
+import { resolveLikeAffinity } from 'aidcp-kernel/kernel/like-affinity.js';
 import { isWritingLanguage } from '../soul/writing-language.js';
-import type { WritingLanguage } from '../kernel/soul-types.js';
+import type { WritingLanguage } from 'aidcp-kernel/kernel/soul-types.js';
 
 export const MAX_PERSONA_BYTES = 32 * 1024;
 // Renderer caps visible content preferences at 24, but the request also carries derived

@@ -12,15 +12,15 @@
  * 复用 server 注入的 RiskController/各 Store 单例。
  */
 
-import type { PublishResult, PublishSourceReference, ReferenceImageSnapshot, TriggerInput } from '../kernel/publish-pipeline-types.js';
-import type { Soul } from '../kernel/soul-types.js';
-import type { CuratedContentTypeFilter, CuratedSelectItem } from '../kernel/curated-content-types.js';
-import type { ContentScheduleApprovalMode } from '../kernel/content-schedule-mode.js';
-import type { PersonaBinding } from '../kernel/persona-binding.js';
+import type { PublishResult, PublishSourceReference, ReferenceImageSnapshot, TriggerInput } from 'aidcp-kernel/kernel/publish-pipeline-types.js';
+import type { Soul } from 'aidcp-kernel/kernel/soul-types.js';
+import type { CuratedContentTypeFilter, CuratedSelectItem } from 'aidcp-kernel/kernel/curated-content-types.js';
+import type { ContentScheduleApprovalMode } from 'aidcp-kernel/kernel/content-schedule-mode.js';
+import type { PersonaBinding } from 'aidcp-kernel/kernel/persona-binding.js';
 import { PERSONA_UNAVAILABLE_REASON } from '../config/mirror-stop-work.js';
-import type { PlatformId } from '../kernel/platform-types.js';
-import { referenceImagesForGeneration, REFERENCE_IMAGE_MAX_COUNT } from '../kernel/reference-image-guidance.js';
-import { shanghaiDayStartMs } from '../time/shanghai-day.js';
+import type { PlatformId } from 'aidcp-kernel/kernel/platform-types.js';
+import { referenceImagesForGeneration, REFERENCE_IMAGE_MAX_COUNT } from 'aidcp-kernel/kernel/reference-image-guidance.js';
+import { shanghaiDayStartMs } from 'aidcp-kernel/time/shanghai-day.js';
 
 /** 洗稿参照笔记（change curated-note-actions）：管理后台精选页人工指定，注入创作输入独立参照块。 */
 export type ReferenceNote = NonNullable<TriggerInput['generateInput']['referenceNote']>;

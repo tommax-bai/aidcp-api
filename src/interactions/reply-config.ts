@@ -11,11 +11,11 @@ import {
   type RiskTag,
   type TemplateVariable,
   type ValidationIssue,
-} from '../kernel/interaction-types.js';
+} from 'aidcp-kernel/kernel/interaction-types.js';
 // 无 Set 依赖的纯校验函数 validateFinalReplyText 析出到 kernel（change decouple-llm-lang-interaction-contracts），
 // 供 automation 侧直接依赖 kernel；本文件内部渲染仍复用它，并对既有导入方等值再导出。
-import { validateFinalReplyText } from '../kernel/interaction-reply-contract.js';
-export { validateFinalReplyText } from '../kernel/interaction-reply-contract.js';
+import { validateFinalReplyText } from 'aidcp-kernel/kernel/interaction-reply-contract.js';
+export { validateFinalReplyText } from 'aidcp-kernel/kernel/interaction-reply-contract.js';
 
 const VARIABLE_SET = new Set<string>(TEMPLATE_VARIABLES);
 const HARD_RISK_SET = new Set<RiskTag>(HARD_RISK_TAGS);

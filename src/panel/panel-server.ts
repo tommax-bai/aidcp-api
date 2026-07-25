@@ -45,18 +45,18 @@ import {
   FacebookGroupScopeError,
   type FacebookGroupMembershipStatus,
   type FacebookGroupTargetInput,
-} from '../kernel/facebook-group-types.js';
+} from 'aidcp-kernel/kernel/facebook-group-types.js';
 import { readDownloadsManifest } from './downloads-manifest.js';
-import { DelegatedTaskServiceError } from '../kernel/delegated-task-types.js';
+import { DelegatedTaskServiceError } from 'aidcp-kernel/kernel/delegated-task-types.js';
 import type {
   DelegatedActionFamily,
   DelegatedTaskIntent,
   DelegatedTaskStatus,
   JsonValue,
-} from '../kernel/delegated-task-types.js';
-import { clampClientApprovalMode, DELEGATED_TASK_STATUSES } from '../kernel/delegated-task-types.js';
+} from 'aidcp-kernel/kernel/delegated-task-types.js';
+import { clampClientApprovalMode, DELEGATED_TASK_STATUSES } from 'aidcp-kernel/kernel/delegated-task-types.js';
 import { buildPublishLifecycle, type ApprovalDispatchProjection } from './publish-stage-lifecycle.js';
-import { CuratedContentUnavailableError } from '../kernel/curated-content-types.js';
+import { CuratedContentUnavailableError } from 'aidcp-kernel/kernel/curated-content-types.js';
 
 /** 登录/写体很小，限制请求体大小防滥用。 */
 const MAX_BODY_BYTES = 16 * 1024;

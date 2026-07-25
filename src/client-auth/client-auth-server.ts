@@ -20,11 +20,11 @@ import type { TokenRevocationStore } from '../panel/revocation.js';
 import type { ClientUserStore } from './client-user-store.js';
 import type { ClientOffboardView } from './client-user-store.js';
 import type { LoginRateLimiter } from './rate-limiter.js';
-import { DelegatedTaskServiceError, type DelegatedTaskServicePort } from '../kernel/delegated-task-types.js';
-import type { DelegatedTaskIntent, JsonValue } from '../kernel/delegated-task-types.js';
-import { clampClientApprovalMode } from '../kernel/delegated-task-types.js';
-import type { CuratedContentReader, CuratedPanelRow, CuratedReferenceImage } from '../kernel/curated-content-types.js';
-import { CuratedContentUnavailableError } from '../kernel/curated-content-types.js';
+import { DelegatedTaskServiceError, type DelegatedTaskServicePort } from 'aidcp-kernel/kernel/delegated-task-types.js';
+import type { DelegatedTaskIntent, JsonValue } from 'aidcp-kernel/kernel/delegated-task-types.js';
+import { clampClientApprovalMode } from 'aidcp-kernel/kernel/delegated-task-types.js';
+import type { CuratedContentReader, CuratedPanelRow, CuratedReferenceImage } from 'aidcp-kernel/kernel/curated-content-types.js';
+import { CuratedContentUnavailableError } from 'aidcp-kernel/kernel/curated-content-types.js';
 import type { ResolvedBinding } from './client-user-store.js';
 import type {
   PublishApprovalActionPayload,

@@ -17,11 +17,11 @@
  *     并在其中构造 `*HttpClient`。默认 local 下 thunk 永不被调用、不构造任何 client、不碰网络。
  * 由此：网关在 api 层但只连 kernel，边界棘轮不升。
  */
-import type { CuratedContentReader } from '../kernel/curated-content-types.js';
-import type { DelegatedTaskServicePort } from '../kernel/delegated-task-types.js';
-import type { InteractionStoreReaderPort } from '../kernel/interaction-types.js';
-import type { PublishStatusReader } from '../kernel/publish-status-types.js';
-import type { PublishGenerationPort } from '../kernel/publish-generation-types.js';
+import type { CuratedContentReader } from 'aidcp-kernel/kernel/curated-content-types.js';
+import type { DelegatedTaskServicePort } from 'aidcp-kernel/kernel/delegated-task-types.js';
+import type { InteractionStoreReaderPort } from 'aidcp-kernel/kernel/interaction-types.js';
+import type { PublishStatusReader } from 'aidcp-kernel/kernel/publish-status-types.js';
+import type { PublishGenerationPort } from 'aidcp-kernel/kernel/publish-generation-types.js';
 
 /** 读端口传输模式。与 transport 的 `ReadPortMode` 语义一致，此处独立声明以免 api→automation 依赖。 */
 export type GatewayMode = 'local' | 'http';

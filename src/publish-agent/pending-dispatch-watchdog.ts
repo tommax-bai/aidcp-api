@@ -13,7 +13,7 @@
  * 每条记录只告警一次（进程内已告警集合），阻塞原因出现或状态迁走即自然退出候选集。
  */
 
-import type { DeploymentTarget } from '../deployment-target.js';
+import type { DeploymentTarget } from 'aidcp-kernel/deployment-target.js';
 import type { ApprovalDecisionRow } from './publish-approval-store.js';
 
 export interface PendingDispatchAlertSink {

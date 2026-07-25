@@ -18,7 +18,7 @@ import type {
   ReplyConfigSnapshot,
   MinimalInbound,
   ReplyPreviewResult,
-} from '../kernel/interaction-types.js';
+} from 'aidcp-kernel/kernel/interaction-types.js';
 
 /**
  * 回复预览生成的**只读窄面**：internal-api / scope-internal-api 只驱动 buildPreview 一个方法，

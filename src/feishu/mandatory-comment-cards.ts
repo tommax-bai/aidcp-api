@@ -1,5 +1,5 @@
-import type { CommentApprovalNoticeInput } from '../kernel/comment-approval-notice.js';
-import type { MandatoryCommentOutcomeNoticeInput } from '../kernel/mandatory-comment-notice.js';
+import type { CommentApprovalNoticeInput } from 'aidcp-kernel/kernel/comment-approval-notice.js';
+import type { MandatoryCommentOutcomeNoticeInput } from 'aidcp-kernel/kernel/mandatory-comment-notice.js';
 import { buildCommandResultCard } from './cards.js';
 import type { FeishuCard } from './types.js';
 

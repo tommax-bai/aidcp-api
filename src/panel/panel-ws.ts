@@ -16,7 +16,7 @@ import {
   PANEL_FRAME_MAX_BYTES,
   panelPayloadByteLength,
   panelPayloadTruncated,
-} from '../kernel/panel-frame-limits.js';
+} from 'aidcp-kernel/kernel/panel-frame-limits.js';
 import { verifyJwt } from './jwt.js';
 import type { TokenRevocationStore } from './revocation.js';
 

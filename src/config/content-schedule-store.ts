@@ -17,13 +17,13 @@
  */
 
 import pg from 'pg';
-import { DEFAULT_PG_CONFIG } from '../kernel/pg-config.js';
+import { DEFAULT_PG_CONFIG } from 'aidcp-kernel/kernel/pg-config.js';
 import { writeWithMirrorBump, type MirrorVersionBumper } from './mirror-version-store.js';
 import { RETIRED_ACCOUNT_ID } from '../account-store.js';
 import { resolveAccountDisplayName, type AccountDisplayNameSource } from '../account-display-name.js';
-import { SHANGHAI_DAY_START_SQL } from '../time/shanghai-day.js';
+import { SHANGHAI_DAY_START_SQL } from 'aidcp-kernel/time/shanghai-day.js';
 import { isValidWeekActiveMask } from '../risk/session-limits.js';
-import type { DeploymentTarget } from '../deployment-target.js';
+import type { DeploymentTarget } from 'aidcp-kernel/deployment-target.js';
 import {
   availableScheduledAutomationActionsForPlatform,
   normalizePlatformForCatalog,
@@ -33,12 +33,12 @@ import {
   type AvailableScheduledAutomationAction,
   type ScheduledAutomationAction,
 } from '../platform/index.js';
-import type { SchemaEnsurer } from '../kernel/schema-capability-contract.js';
+import type { SchemaEnsurer } from 'aidcp-kernel/kernel/schema-capability-contract.js';
 import {
   CONTENT_SCHEDULE_ACTION_MODES,
   type ContentScheduleActionMode,
   type ContentScheduleApprovalMode,
-} from '../kernel/content-schedule-mode.js';
+} from 'aidcp-kernel/kernel/content-schedule-mode.js';
 
 const { Pool } = pg;
 

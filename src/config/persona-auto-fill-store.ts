@@ -6,9 +6,9 @@
  */
 import crypto from 'node:crypto';
 import pg from 'pg';
-import { resolveEnvPgConfig } from '../kernel/pg-config.js';
-import type { WritingLanguage } from '../kernel/soul-types.js';
-import type { SchemaEnsurer } from '../kernel/schema-capability-contract.js';
+import { resolveEnvPgConfig } from 'aidcp-kernel/kernel/pg-config.js';
+import type { WritingLanguage } from 'aidcp-kernel/kernel/soul-types.js';
+import type { SchemaEnsurer } from 'aidcp-kernel/kernel/schema-capability-contract.js';
 
 const { Pool } = pg;
 

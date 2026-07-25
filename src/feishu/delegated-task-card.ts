@@ -1,6 +1,6 @@
-import type { DelegatedTaskConfirmationSummary, DelegatedTaskServicePort } from '../kernel/delegated-task-types.js';
-import { DelegatedTaskServiceError } from '../kernel/delegated-task-types.js';
-import type { DelegatedTask } from '../kernel/delegated-task-types.js';
+import type { DelegatedTaskConfirmationSummary, DelegatedTaskServicePort } from 'aidcp-kernel/kernel/delegated-task-types.js';
+import { DelegatedTaskServiceError } from 'aidcp-kernel/kernel/delegated-task-types.js';
+import type { DelegatedTask } from 'aidcp-kernel/kernel/delegated-task-types.js';
 import type { FeishuCard, FeishuField, FeishuHeaderTemplate } from './types.js';
 
 export type DelegatedTaskCardAction = 'confirm' | 'cancel' | 'pause' | 'resume' | 'status';

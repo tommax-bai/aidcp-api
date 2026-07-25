@@ -10,11 +10,11 @@
  */
 
 import pg from 'pg';
-import { RETIRED_ACCOUNT_ID } from './kernel/account-identity.js';
-import { DEFAULT_PG_CONFIG } from './kernel/pg-config.js';
+import { RETIRED_ACCOUNT_ID } from 'aidcp-kernel/kernel/account-identity.js';
+import { DEFAULT_PG_CONFIG } from 'aidcp-kernel/kernel/pg-config.js';
 import { writeWithMirrorBump, type MirrorVersionBumper } from './config/mirror-version-store.js';
 import { normalizePlatformId, type PlatformId } from './platform/index.js';
-import { parseDeploymentTarget, type DeploymentTarget } from './deployment-target.js';
+import { parseDeploymentTarget, type DeploymentTarget } from 'aidcp-kernel/deployment-target.js';
 import type { ClaimExecutionTargetResult } from './risk/ownership.js';
 import {
   accountDisplayNameCandidates,
@@ -22,8 +22,8 @@ import {
   type AccountDisplayName,
   type AccountDisplayNameInput,
 } from './account-display-name.js';
-import type { SchemaEnsurer } from './kernel/schema-capability-contract.js';
-import type { AccountIdentityProjectionRow } from './kernel/account-projection-types.js';
+import type { SchemaEnsurer } from 'aidcp-kernel/kernel/schema-capability-contract.js';
+import type { AccountIdentityProjectionRow } from 'aidcp-kernel/kernel/account-projection-types.js';
 
 const { Pool } = pg;
 

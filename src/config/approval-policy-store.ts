@@ -6,9 +6,9 @@
  * card. Missing rows preserve the legacy behavior.
  */
 import pg from 'pg';
-import { resolveEnvPgConfig } from '../kernel/pg-config.js';
+import { resolveEnvPgConfig } from 'aidcp-kernel/kernel/pg-config.js';
 import { RETIRED_ACCOUNT_ID } from '../account-store.js';
-import type { SchemaEnsurer } from '../kernel/schema-capability-contract.js';
+import type { SchemaEnsurer } from 'aidcp-kernel/kernel/schema-capability-contract.js';
 
 const { Pool } = pg;
 

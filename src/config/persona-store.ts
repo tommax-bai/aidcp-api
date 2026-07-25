@@ -16,12 +16,12 @@
 
 import pg from 'pg';
 import { readFileSync } from 'node:fs';
-import { DEFAULT_PG_CONFIG } from '../kernel/pg-config.js';
+import { DEFAULT_PG_CONFIG } from 'aidcp-kernel/kernel/pg-config.js';
 import { loadSoulFromYaml, defaultSoulPath, type Soul } from '../soul/index.js';
 import { mirrorStateOf } from '../config-mirror-freshness.js';
 import { writeWithMirrorBump, type MirrorVersionBumper } from './mirror-version-store.js';
-import type { SchemaEnsurer } from '../kernel/schema-capability-contract.js';
-import type { PersonaBinding } from '../kernel/persona-binding.js';
+import type { SchemaEnsurer } from 'aidcp-kernel/kernel/schema-capability-contract.js';
+import type { PersonaBinding } from 'aidcp-kernel/kernel/persona-binding.js';
 
 const { Pool } = pg;
 

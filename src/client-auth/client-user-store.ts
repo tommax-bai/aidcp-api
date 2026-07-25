@@ -44,18 +44,18 @@
 
 import crypto from 'node:crypto';
 import pg from 'pg';
-import { resolveEnvPgConfig } from '../kernel/pg-config.js';
+import { resolveEnvPgConfig } from 'aidcp-kernel/kernel/pg-config.js';
 import { lockEnvironmentRow } from '../db/environment-row-lock.js';
 import { generateKey, hashKey, verifyKey, decoyVerify } from './key.js';
 import { RETIRED_ACCOUNT_ID } from '../account-store.js';
-import { shanghaiDayStartMs } from '../time/shanghai-day.js';
+import { shanghaiDayStartMs } from 'aidcp-kernel/time/shanghai-day.js';
 import { resolveAccountDisplayName } from '../account-display-name.js';
 import { isMirrorStale, type ConfigMirrorKey } from '../config-mirror-freshness.js';
 import { writeWithMirrorBump, type MirrorVersionBumper } from '../config/mirror-version-store.js';
-import type { SchemaEnsurer } from '../kernel/schema-capability-contract.js';
-import type { ClientEnvAutomationReader, OffboardProjection } from '../kernel/client-env-automation-types.js';
-import type { OffboardCleanupGrantOperations } from '../kernel/offboard-cleanup-grant-types.js';
-import type { OffboardMaterializationOperations } from '../kernel/offboard-materialization-types.js';
+import type { SchemaEnsurer } from 'aidcp-kernel/kernel/schema-capability-contract.js';
+import type { ClientEnvAutomationReader, OffboardProjection } from 'aidcp-kernel/kernel/client-env-automation-types.js';
+import type { OffboardCleanupGrantOperations } from 'aidcp-kernel/kernel/offboard-cleanup-grant-types.js';
+import type { OffboardMaterializationOperations } from 'aidcp-kernel/kernel/offboard-materialization-types.js';
 
 const { Pool } = pg;
 

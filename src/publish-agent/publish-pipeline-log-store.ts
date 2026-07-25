@@ -10,9 +10,9 @@
  *     如需正文/产出，后续按角色 watchKeys 裁剪后再补，不在最小改动里。
  */
 import pg from 'pg';
-import { DEFAULT_PG_CONFIG } from '../kernel/pg-config.js';
+import { DEFAULT_PG_CONFIG } from 'aidcp-kernel/kernel/pg-config.js';
 
-import type { PipelineLogEntry, PipelineLogSink } from '../kernel/pipeline-log-contract.js';
+import type { PipelineLogEntry, PipelineLogSink } from 'aidcp-kernel/kernel/pipeline-log-contract.js';
 
 const { Pool } = pg;
 

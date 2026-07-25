@@ -19,7 +19,7 @@ import type {
   CuratedPanelListResult,
   CuratedPanelRow,
   CuratedFacets,
-} from '../kernel/curated-content-types.js';
+} from 'aidcp-kernel/kernel/curated-content-types.js';
 import type { PublishLogStore, EditDraftPatch, EditDraftResult } from '../publish-agent/publish-log-store.js';
 import type { QueueStatusLike } from './publish-stage-lifecycle.js';
 import type { SetGroupLabelResult, SetContactInfoResult } from '../account-store.js';
@@ -44,7 +44,7 @@ import type {
   FacebookGroupTargetListResult,
   FacebookGroupTargetRow,
   ReplaceFacebookGroupTargetScopesResult,
-} from '../kernel/facebook-group-types.js';
+} from 'aidcp-kernel/kernel/facebook-group-types.js';
 import type {
   ContentScheduleCatalogRow,
   AccountContentSchedulePatch,
@@ -80,7 +80,7 @@ import type { BillingPriceRefreshResult } from '../metrics/billing-price-refresh
 import type { NotificationContact, NotificationContactManual } from '../cache/notification-contact-store.js';
 import type { ThinkingMode, ThinkingModeApi } from '../config/role-catalog.js';
 import type { AlertStore } from '../alerts/index.js';
-import type { DelegatedTaskServicePort } from '../kernel/delegated-task-types.js';
+import type { DelegatedTaskServicePort } from 'aidcp-kernel/kernel/delegated-task-types.js';
 import type { InteractionPermissionOverview } from '../interactions/interaction-panel-permissions.js';
 import type {
   AccountCommentApprovalMode,

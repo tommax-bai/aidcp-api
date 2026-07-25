@@ -16,9 +16,9 @@
 import pg from 'pg';
 // DEFAULT_PG_CONFIG 的真实归属是 kernel（pg-config.ts），pg-anchor-cache 只是再导出；api
 // 直连 kernel（api→kernel 恒允许），取值逐字不变，消去 api→automation 这一跨边界豁免。
-import { DEFAULT_PG_CONFIG } from '../kernel/pg-config.js';
+import { DEFAULT_PG_CONFIG } from 'aidcp-kernel/kernel/pg-config.js';
 import type { NotificationItem } from '../comm/protocol.js';
-import type { SchemaEnsurer } from '../kernel/schema-capability-contract.js';
+import type { SchemaEnsurer } from 'aidcp-kernel/kernel/schema-capability-contract.js';
 
 const { Pool } = pg;
 

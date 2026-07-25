@@ -21,8 +21,8 @@
 
 import { isValidWeekActiveMask, isWeekActiveAt } from '../risk/session-limits.js';
 import { actionModeEnabled, type ContentScheduleActionMode, type ContentScheduleApprovalMode } from '../config/content-schedule-store.js';
-import type { PlatformId } from '../kernel/platform-types.js';
-import type { DeploymentTarget } from '../deployment-target.js';
+import type { PlatformId } from 'aidcp-kernel/kernel/platform-types.js';
+import type { DeploymentTarget } from 'aidcp-kernel/deployment-target.js';
 
 export interface OnlineAccountIdentity {
   accountId: string;

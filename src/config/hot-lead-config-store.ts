@@ -13,13 +13,13 @@
  * 语义不同，故独立于限频表、绝不混用。
  */
 import pg from 'pg';
-import { DEFAULT_PG_CONFIG } from '../kernel/pg-config.js';
+import { DEFAULT_PG_CONFIG } from 'aidcp-kernel/kernel/pg-config.js';
 import { writeWithMirrorBump, type MirrorVersionBumper } from './mirror-version-store.js';
 import {
   DEFAULT_HOT_LEAD_GATE_CONFIG,
   type HotLeadGateConfig,
 } from '../hot-lead/heat-velocity.js';
-import type { SchemaEnsurer } from '../kernel/schema-capability-contract.js';
+import type { SchemaEnsurer } from 'aidcp-kernel/kernel/schema-capability-contract.js';
 
 const { Pool } = pg;
 

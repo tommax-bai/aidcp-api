@@ -18,8 +18,8 @@
  */
 
 import pg from 'pg';
-import { DEFAULT_PG_CONFIG } from '../kernel/pg-config.js';
-import { parseDeploymentTarget, type DeploymentTarget } from '../deployment-target.js';
+import { DEFAULT_PG_CONFIG } from 'aidcp-kernel/kernel/pg-config.js';
+import { parseDeploymentTarget, type DeploymentTarget } from 'aidcp-kernel/deployment-target.js';
 
 const { Pool } = pg;
 
@@ -91,7 +91,7 @@ import {
   ApprovalUnreadableError,
   type ApprovalVoidReason,
   type ApprovalBlockedReason,
-} from '../kernel/publish-approval-contract.js';
+} from 'aidcp-kernel/kernel/publish-approval-contract.js';
 export {
   APPROVAL_VOID_REASONS,
   isApprovalVoidReason,

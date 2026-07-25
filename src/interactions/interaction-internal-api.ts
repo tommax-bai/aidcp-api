@@ -7,7 +7,7 @@ import {
   InteractionError,
   type RuntimeControls,
   type InteractionStoreReaderPort,
-} from '../kernel/interaction-types.js';
+} from 'aidcp-kernel/kernel/interaction-types.js';
 
 export type InteractionGrant =
   | 'interaction.config.view'

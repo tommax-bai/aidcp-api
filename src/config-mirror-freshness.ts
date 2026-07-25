@@ -28,8 +28,8 @@
  * automation 与 api 两侧的配置写入方都要引用它，留在任一属主域都会造出一条跨域 import。
  * 本模块等值再导出，既有 import 路径全部保持不变。
  */
-export type { ConfigMirrorKey } from './kernel/config-mirror-bump-types.js';
-import type { ConfigMirrorKey } from './kernel/config-mirror-bump-types.js';
+export type { ConfigMirrorKey } from 'aidcp-kernel/kernel/config-mirror-bump-types.js';
+import type { ConfigMirrorKey } from 'aidcp-kernel/kernel/config-mirror-bump-types.js';
 
 /** 副本读取状态。`stale` = 距上一次**成功完成版本比对**已超过该镜像声明的陈旧上限。 */
 export type MirrorReadState = 'fresh' | 'stale';

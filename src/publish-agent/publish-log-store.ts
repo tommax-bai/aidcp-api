@@ -5,13 +5,13 @@
  */
 
 import pg from 'pg';
-import { DEFAULT_PG_CONFIG } from '../kernel/pg-config.js';
-import { SHANGHAI_DAY_START_SQL } from '../time/shanghai-day.js';
-import type { PublishRecord, PublishStatus, PublishMetadata, PublishMode, Visibility } from '../kernel/publish-pipeline-types.js';
-import { clampTitle } from '../kernel/title-clamp.js';
+import { DEFAULT_PG_CONFIG } from 'aidcp-kernel/kernel/pg-config.js';
+import { SHANGHAI_DAY_START_SQL } from 'aidcp-kernel/time/shanghai-day.js';
+import type { PublishRecord, PublishStatus, PublishMetadata, PublishMode, Visibility } from 'aidcp-kernel/kernel/publish-pipeline-types.js';
+import { clampTitle } from 'aidcp-kernel/kernel/title-clamp.js';
 import { normalizePlatformId, type PlatformId } from '../platform/index.js';
 import { validatePublishSchedule } from './schedule-policy.js';
-import type { DeploymentTarget } from '../deployment-target.js';
+import type { DeploymentTarget } from 'aidcp-kernel/deployment-target.js';
 import { ensureCapabilitySchema, probeSchemaShape } from '../schema/schema-capability.js';
 
 /**

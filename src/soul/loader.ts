@@ -10,7 +10,7 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { parseYaml, type YamlValue } from '../kernel/yaml.js';
+import { parseYaml, type YamlValue } from 'aidcp-kernel/kernel/yaml.js';
 import type {
   Soul,
   SoulIdentity,
@@ -27,8 +27,8 @@ import type {
   BehaviorGuidelines,
   LikeAffinity,
   WritingLanguage,
-} from '../kernel/soul-types.js';
-import { LIKE_AFFINITY_VALUES } from '../kernel/like-affinity.js';
+} from 'aidcp-kernel/kernel/soul-types.js';
+import { LIKE_AFFINITY_VALUES } from 'aidcp-kernel/kernel/like-affinity.js';
 import { isWritingLanguage } from './writing-language.js';
 
 const MANDATORY_INTERACTION_ACTIONS = new Set<MandatoryInteractionAction>(['like', 'comment']);

@@ -14,7 +14,7 @@ import {
   type ReplyJobView,
   type ScopedJobContext,
   type InteractionStoreReaderPort,
-} from '../kernel/interaction-types.js';
+} from 'aidcp-kernel/kernel/interaction-types.js';
 
 const MAX_BODY = 64 * 1024;
 

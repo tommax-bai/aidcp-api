@@ -2,11 +2,11 @@ import type { ReplyConfigScopeStore } from './reply-config-scope-store.js';
 import type {
   EffectiveReplyConfig,
   ReplyConfigSnapshot,
-} from '../kernel/interaction-types.js';
+} from 'aidcp-kernel/kernel/interaction-types.js';
 
 // 纯读取端口与两个无状态读取函数已析出到 kernel（change decouple-llm-lang-interaction-contracts）；
 // 连库的 ReplyConfigResolver 类留在本文件。对既有从本文件取这三者的导入方保持等值再导出。
-export { readJobConfig, readPublishedConfig, type ReplyConfigReader } from '../kernel/interaction-reply-contract.js';
+export { readJobConfig, readPublishedConfig, type ReplyConfigReader } from 'aidcp-kernel/kernel/interaction-reply-contract.js';
 
 export class ReplyConfigResolver {
   readonly mode = 'scoped' as const;

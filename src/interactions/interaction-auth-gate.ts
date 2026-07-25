@@ -29,7 +29,7 @@ import type {
   InteractionEnvironmentSerialization,
   InteractionScopeCheck,
   InteractionScopeCheckInput,
-} from '../kernel/interaction-auth-gate-types.js';
+} from 'aidcp-kernel/kernel/interaction-auth-gate-types.js';
 
 export interface PgInteractionAuthGateOptions {
   /** api 属主池（组合根注入）。 */

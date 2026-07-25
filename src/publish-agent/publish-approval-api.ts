@@ -13,7 +13,7 @@
  * 后者是「不知道批没批」，后者要落 `dispatch_blocked_reason='approval_unreadable'` 并对运营可见。
  */
 
-import type { DeploymentTarget } from '../deployment-target.js';
+import type { DeploymentTarget } from 'aidcp-kernel/deployment-target.js';
 import {
   ApprovalUnreadableError,
   isApprovalVoidReason,

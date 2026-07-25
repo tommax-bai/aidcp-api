@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import pg from 'pg';
-import { resolveEnvPgConfig } from '../kernel/pg-config.js';
+import { resolveEnvPgConfig } from 'aidcp-kernel/kernel/pg-config.js';
 import { normalizeReplyProfile, validateReplyConfig } from './reply-config.js';
 import {
   DEFAULT_REPLY_POLICY,
@@ -14,7 +14,7 @@ import {
   type ReplyProfile,
   type ReplyRule,
   type ReplyTemplate,
-} from '../kernel/interaction-types.js';
+} from 'aidcp-kernel/kernel/interaction-types.js';
 
 const { Pool } = pg;
 
