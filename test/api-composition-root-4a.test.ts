@@ -2,10 +2,14 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { test } from 'node:test';
 import type { FacebookGroupOpsPort } from 'aidcp-kernel/kernel/facebook-group-ops-types.js';
-import type { FacebookScopeCommandPort } from 'aidcp-kernel/kernel/api-direct-port.js';
+import type {
+  AutomationPublishLogPort,
+  FacebookScopeCommandPort,
+} from 'aidcp-kernel/kernel/api-direct-port.js';
 import type { DispatchDraft } from '../src/publish-agent/publish-log-store.js';
 import {
   createApiPanelFacebookGroupTargets,
+  createApiPublishLogAuthority,
   createApiPublishOwnerHandlers,
 } from '../src/server.js';
 
@@ -90,10 +94,14 @@ test('Edge publish routes execute the API owner draft CAS and 3b approval writer
   const edits: unknown[] = [];
   const writes: unknown[] = [];
   const previews: number[] = [];
-  const handlers = createApiPublishOwnerHandlers({
-    publishLog: {
-      loadForDispatch: async (recordId) => draft(recordId),
-      editDraft: async (recordId, expectedVersion, patch, editor) => {
+  const owner = {
+      loadForDispatch: async (recordId: number) => draft(recordId),
+      editDraft: async (
+        recordId: number,
+        expectedVersion: number,
+        patch: Parameters<AutomationPublishLogPort['editDraft']>[2],
+        editor: string,
+      ) => {
         edits.push({ recordId, expectedVersion, patch, editor });
         return {
           ok: true,
@@ -105,19 +113,30 @@ test('Edge publish routes execute the API owner draft CAS and 3b approval writer
         };
       },
       rejectPendingApproval: async () => true,
+    } as unknown as AutomationPublishLogPort;
+  const publishLog = createApiPublishLogAuthority(
+    owner,
+    {
+      pushPreview: async (recordId) => {
+        previews.push(recordId);
+        return { outcome: 'no_record', recordId };
+      },
+      pushState: async (accountId, recordId) => ({
+        outcome: 'applied',
+        commandId: `state:${recordId}`,
+        accountId,
+      }),
     },
+    { warn: () => {} },
+  );
+  const handlers = createApiPublishOwnerHandlers({
+    publishLog,
     approvalClient: { readApproval: async () => null },
     writeApprovalDecision: async (requestId, approved, payload, context) => {
       writes.push({ requestId, approved, payload, context });
       return { written: true, revision: 7 };
     },
     triggerApproved: async () => {},
-    publishUi: {
-      pushPreview: async (recordId) => {
-        previews.push(recordId);
-        return { outcome: 'no_record', recordId };
-      },
-    },
     logger: { warn: () => {} },
   });
 
@@ -142,7 +161,7 @@ test('Edge publish routes execute the API owner draft CAS and 3b approval writer
     editor: 'edge:one',
   }]);
   await nextTurn();
-  assert.deepEqual(previews, [89]);
+  assert.deepEqual(previews, [89], 'successful owner edit emits exactly one preview');
 
   const decided = await handlers.edgePublish.decidePublishApproval({
     payload: { requestId: 'publish-89', approved: true, contentVersion: 4 },
@@ -186,9 +205,6 @@ test('Feishu ingress reuses the 3b writer, live-version/preflight, approve trigg
     },
     triggerApproved: async (requestId, revision, kind) => {
       triggers.push({ requestId, revision, kind });
-    },
-    publishUi: {
-      pushPreview: async (recordId) => ({ outcome: 'no_record', recordId }),
     },
     logger: { warn: () => {} },
   });

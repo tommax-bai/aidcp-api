@@ -379,6 +379,85 @@ export function createApiPanelFacebookGroupTargets(
   };
 }
 
+export function createApiPublishLogAuthority(
+  owner: AutomationPublishLogPort,
+  publishUi: Pick<
+    ReturnType<typeof createPublishUiUpdateProducer>,
+    'pushPreview' | 'pushState'
+  >,
+  logger: Pick<Console, 'warn'> = console,
+): AutomationPublishLogPort {
+  return {
+    loadForDispatch: (recordId) => owner.loadForDispatch(recordId),
+    updateStatus: (recordId, status) => owner.updateStatus(recordId, status),
+    updatePostId: (recordId, postId, postUrl) =>
+      owner.updatePostId(recordId, postId, postUrl),
+    markScheduled: (recordId, scheduledAt, scheduledPlatformId) =>
+      owner.markScheduled(recordId, scheduledAt, scheduledPlatformId),
+    markImagesAttached: (recordId, imageCount) =>
+      owner.markImagesAttached(recordId, imageCount),
+    listDueScheduled: (limit, now) => owner.listDueScheduled(limit, now),
+    deferScheduledReconcile: (recordId, error, nextAt, maxAttempts) =>
+      owner.deferScheduledReconcile(recordId, error, nextAt, maxAttempts),
+    confirmScheduledPublished: (recordId, postId, postUrl) =>
+      owner.confirmScheduledPublished(recordId, postId, postUrl),
+    getMostRecentPublishTime: () => owner.getMostRecentPublishTime(),
+    recentPublishedContents: (limit) => owner.recentPublishedContents(limit),
+    editDraft: async (recordId, expectedVersion, patch, editor, expectedAccountId) => {
+      const result = await owner.editDraft(
+        recordId,
+        expectedVersion,
+        patch,
+        editor,
+        expectedAccountId,
+      );
+      if (result.ok) {
+        void publishUi.pushPreview(recordId).catch((error) => {
+          logger.warn(
+            `[aidcp-api] draft committed; UI preview delivery failed record=${recordId}: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        });
+      }
+      return result;
+    },
+    rejectPendingApproval: async (recordId) => {
+      const draft = await owner.loadForDispatch(recordId);
+      const rejected = await owner.rejectPendingApproval(recordId);
+      if (rejected && draft) {
+        void publishUi
+          .pushState(
+            draft.accountId,
+            recordId,
+            'rejected',
+            draft.contentVersion,
+            draft.title,
+          )
+          .catch((error) => {
+            logger.warn(
+              `[aidcp-api] rejection committed; UI state delivery failed record=${recordId}: ${
+                error instanceof Error ? error.message : String(error)
+              }`,
+            );
+          });
+      }
+      return rejected;
+    },
+    pendingApprovalForAccount: (accountId) => owner.pendingApprovalForAccount(accountId),
+    pendingPublishPreviewForAccount: (accountId) =>
+      owner.pendingPublishPreviewForAccount(accountId),
+    lastPublishedForAccount: (accountId) => owner.lastPublishedForAccount(accountId),
+    countPendingForAccount: (accountId) => owner.countPendingForAccount(accountId),
+    countPendingAutonomousForAccount: (accountId) =>
+      owner.countPendingAutonomousForAccount(accountId),
+    countPublishedTodayForAccount: (accountId) =>
+      owner.countPublishedTodayForAccount(accountId),
+    countPublishedSinceForAccount: (accountId, since) =>
+      owner.countPublishedSinceForAccount(accountId, since),
+  };
+}
+
 interface ApiPublishOwnerHandlerDeps {
   publishLog: Pick<
     AutomationPublishLogPort,
@@ -391,7 +470,6 @@ interface ApiPublishOwnerHandlerDeps {
     revision: number,
     kind: 'human_reconfirm',
   ): Promise<void>;
-  publishUi: Pick<ReturnType<typeof createPublishUiUpdateProducer>, 'pushPreview'>;
   logger?: Pick<Console, 'warn'>;
 }
 
@@ -418,15 +496,6 @@ export function createApiPublishOwnerHandlers(
     return draft
       ? { ok: true, accountId: draft.accountId }
       : { ok: false, reason: 'publish_target_unavailable' };
-  };
-  const refreshPreview = (recordId: number): void => {
-    void deps.publishUi.pushPreview(recordId).catch((error) => {
-      logger.warn(
-        `[publish-ui-update] API draft action preview delivery failed recordId=${recordId}: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      );
-    });
   };
   const triggerApproved = (trigger: {
     requestId: string;
@@ -461,7 +530,9 @@ export function createApiPublishOwnerHandlers(
     editDraft: (recordId, expectedVersion, patch, editor) =>
       deps.publishLog.editDraft(recordId, expectedVersion, patch, editor),
     readLiveVersion: readLiveContentVersion,
-    refreshPreview,
+    // The injected publish-log authority owns the one-way preview producer for
+    // every successful owner mutation. The handler must not emit a second copy.
+    refreshPreview: () => {},
     logger,
   });
   const decidePublishApproval = createClientPublishApprovalHandler({
@@ -608,76 +679,11 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
     command: pairedCommands.publishUi,
   });
 
-  const publishLog: AutomationPublishLogPort = {
-    loadForDispatch: (recordId) => publishLogStore.loadForDispatch(recordId),
-    updateStatus: (recordId, status) => publishLogStore.updateStatus(recordId, status),
-    updatePostId: (recordId, postId, postUrl) =>
-      publishLogStore.updatePostId(recordId, postId, postUrl),
-    markScheduled: (recordId, scheduledAt, scheduledPlatformId) =>
-      publishLogStore.markScheduled(recordId, scheduledAt, scheduledPlatformId),
-    markImagesAttached: (recordId, imageCount) =>
-      publishLogStore.markImagesAttached(recordId, imageCount),
-    listDueScheduled: (limit, now) => publishLogStore.listDueScheduled(limit, now),
-    deferScheduledReconcile: (recordId, error, nextAt, maxAttempts) =>
-      publishLogStore.deferScheduledReconcile(recordId, error, nextAt, maxAttempts),
-    confirmScheduledPublished: (recordId, postId, postUrl) =>
-      publishLogStore.confirmScheduledPublished(recordId, postId, postUrl),
-    getMostRecentPublishTime: () => publishLogStore.getMostRecentPublishTime(),
-    recentPublishedContents: (limit) => publishLogStore.recentPublishedContents(limit),
-    editDraft: async (recordId, expectedVersion, patch, editor, expectedAccountId) => {
-      const result = await publishLogStore.editDraft(
-        recordId,
-        expectedVersion,
-        patch,
-        editor,
-        expectedAccountId,
-      );
-      if (result.ok) {
-        void publishUi.pushPreview(recordId).catch((error) => {
-          console.warn(
-            `[aidcp-api] draft committed; UI preview delivery failed record=${recordId}: `
-              + `${error instanceof Error ? error.message : String(error)}`,
-          );
-        });
-      }
-      return result;
-    },
-    rejectPendingApproval: async (recordId) => {
-      const draft = await publishLogStore.loadForDispatch(recordId);
-      const rejected = await publishLogStore.rejectPendingApproval(recordId);
-      if (rejected && draft) {
-        void publishUi
-          .pushState(
-            draft.accountId,
-            recordId,
-            'rejected',
-            draft.contentVersion,
-            draft.title,
-          )
-          .catch((error) => {
-            console.warn(
-              `[aidcp-api] rejection committed; UI state delivery failed record=${recordId}: `
-                + `${error instanceof Error ? error.message : String(error)}`,
-            );
-          });
-      }
-      return rejected;
-    },
-    pendingApprovalForAccount: (accountId) =>
-      publishLogStore.pendingApprovalForAccount(accountId),
-    pendingPublishPreviewForAccount: (accountId) =>
-      publishLogStore.pendingPublishPreviewForAccount(accountId),
-    lastPublishedForAccount: (accountId) =>
-      publishLogStore.lastPublishedForAccount(accountId),
-    countPendingForAccount: (accountId) =>
-      publishLogStore.countPendingForAccount(accountId),
-    countPendingAutonomousForAccount: (accountId) =>
-      publishLogStore.countPendingAutonomousForAccount(accountId),
-    countPublishedTodayForAccount: (accountId) =>
-      publishLogStore.countPublishedTodayForAccount(accountId),
-    countPublishedSinceForAccount: (accountId, since) =>
-      publishLogStore.countPublishedSinceForAccount(accountId, since),
-  };
+  const publishLog = createApiPublishLogAuthority(
+    publishLogStore,
+    publishUi,
+    console,
+  );
 
   const publishApprovalAuthority = createPublishApprovalAuthorityService(
     publishApprovalStore,
@@ -745,7 +751,6 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
         kind,
       });
     },
-    publishUi,
     logger: console,
   });
   const edgePublish = publishOwnerHandlers.edgePublish;
