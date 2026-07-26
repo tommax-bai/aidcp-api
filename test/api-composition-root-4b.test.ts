@@ -17,15 +17,21 @@ import {
   InternalHttpClient,
   InternalHttpServer,
 } from 'aidcp-transport/transport/internal-http.js';
+import {
+  SYNC_READ_CHANGED_ROUTE,
+  SyncReadChangedHttpClient,
+} from 'aidcp-transport/transport/sync-read-changed-http.js';
 import { SyncReadSnapshotHttpClient } from 'aidcp-transport/transport/sync-read-snapshot-http.js';
 
 import { ApiSyncReadMirrors } from '../src/config/api-sync-read-mirrors.js';
 import {
+  API_SYNC_READ_CHANGED_STREAMS,
   API_SYNC_READ_CONSUMED_STREAMS,
   API_SYNC_READ_OWNED_STREAMS,
   API_SYNC_READ_PUBLIC_SURFACE_LEDGER,
   ApiSyncReadConsumerRuntime,
   createApiSyncReadPanelEvidencePorts,
+  registerApiSyncReadChangedIngress,
   registerApiSyncReadOwnerRoute,
   type ApiSyncReadCheckpointPort,
   type ApiSyncReadSnapshotClient,
@@ -75,6 +81,7 @@ function envelope(
 
 class FakeSnapshotClient implements ApiSyncReadSnapshotClient {
   readonly failures = new Set<ConsumedStream>();
+  readonly cursors = new Map<ConsumedStream, string>();
   observedAt = 100;
 
   constructor(private readonly calls: string[]) {}
@@ -88,7 +95,11 @@ class FakeSnapshotClient implements ApiSyncReadSnapshotClient {
     if (this.failures.has(consumed)) {
       throw new Error(`owner_unavailable:${consumed}`);
     }
-    const snapshot = envelope(consumed, this.observedAt);
+    const snapshot = envelope(
+      consumed,
+      this.observedAt,
+      this.cursors.get(consumed) ?? '1',
+    );
     assert.equal(
       validateValue?.(snapshot.value) ?? isSyncReadFactPayload(stream, snapshot.value),
       true,
@@ -152,6 +163,17 @@ test('4b API mirror bootstrap restores every target checkpoint before authentica
   assert.equal(presence.onlineEdgeCount, 0);
   assert.equal(presence.resolveEdgeIdForAccount('missing'), null);
   assert.equal(mirrors.inFlightEvidence().recordIds?.size, 0);
+
+  client.observedAt = 120;
+  const periodic = await runtime.refreshAll();
+  assert.equal(periodic.readiness.state, 'ready');
+  for (const stream of API_SYNC_READ_CONSUMED_STREAMS) {
+    assert.equal(
+      calls.filter((call) => call === `fetch:${stream}`).length,
+      2,
+      `periodic full refresh must fetch ${stream} even without a notification`,
+    );
+  }
 });
 
 test('4b API first-load and checkpoint failures remain blocker-level unknown and recover by full fetch', async () => {
@@ -175,6 +197,17 @@ test('4b API first-load and checkpoint failures remain blocker-level unknown and
   );
   assert.equal(mirrors.presence().state, 'unknown');
   assert.equal(mirrors.presence().onlineEdgeCount, null);
+  const health = runtime.health();
+  assert.equal(health.readiness.state, 'not_ready');
+  assert.equal(
+    health.streams.find((stream) => stream.stream === 'edge_presence')?.state,
+    'recovering',
+  );
+  assert.match(
+    health.streams.find((stream) => stream.stream === 'edge_presence')
+      ?.lastError ?? '',
+    /owner_unavailable:edge_presence/,
+  );
 
   client.failures.delete('edge_presence');
   client.observedAt = 120;
@@ -296,18 +329,107 @@ test('4b API owner route serves only B1/B2/B4/B5 streams with target-bound auth'
   ]);
 });
 
+test('4b changed ingress ACKs A3-A6 only after generation-bound fetch, apply, and checkpoint save', async () => {
+  const calls: string[] = [];
+  const mirrors = new ApiSyncReadMirrors('dev', () => 100);
+  const snapshots = new FakeSnapshotClient(calls);
+  const runtime = new ApiSyncReadConsumerRuntime(
+    mirrors,
+    checkpointPort(calls),
+    snapshots,
+    { warn: () => {} },
+  );
+  assert.equal((await runtime.bootstrap()).readiness.state, 'ready');
+
+  const server = new InternalHttpServer();
+  registerApiSyncReadChangedIngress(server, runtime, 'dev', 'api-secret');
+  const port = await server.listen(0);
+  try {
+    const http = new InternalHttpClient(`http://127.0.0.1:${port}`);
+    const changed = new SyncReadChangedHttpClient(http, {
+      executionTarget: 'dev',
+      bearerToken: 'api-secret',
+    });
+    snapshots.observedAt = 120;
+    await changed.deliver({ stream: 'edge_presence', generation: '1' });
+    assert.deepEqual(calls.slice(-2), [
+      'fetch:edge_presence',
+      'save:edge_presence',
+    ]);
+
+    await assert.rejects(
+      changed.deliver({ stream: 'edge_presence', generation: '2' }),
+      /sync_read_snapshot_generation_behind/,
+    );
+    assert.equal(mirrors.presence().state, 'unknown');
+    snapshots.cursors.set('edge_presence', '2');
+    snapshots.observedAt = 140;
+    await changed.deliver({ stream: 'edge_presence', generation: '2' });
+    assert.equal(mirrors.presence().state, 'fresh');
+
+    const wrongTarget = new SyncReadChangedHttpClient(http, {
+      executionTarget: 'ol',
+      bearerToken: 'api-secret',
+    });
+    await assert.rejects(
+      wrongTarget.deliver({ stream: 'edge_presence', generation: '2' }),
+      /target/,
+    );
+    const wrongToken = new SyncReadChangedHttpClient(http, {
+      executionTarget: 'dev',
+      bearerToken: 'wrong-secret',
+    });
+    await assert.rejects(
+      wrongToken.deliver({ stream: 'edge_presence', generation: '2' }),
+      /auth/,
+    );
+    await assert.rejects(
+      http.callBearer(
+        SYNC_READ_CHANGED_ROUTE,
+        {
+          contractVersion: 1,
+          stream: 'session_config_global',
+          generation: '2',
+        },
+        'api-secret',
+      ),
+      /stream/,
+    );
+  } finally {
+    await server.close();
+  }
+
+  assert.deepEqual(API_SYNC_READ_CHANGED_STREAMS, [
+    'edge_presence',
+    'publish_in_flight',
+    'captcha_availability',
+    'automation_config_mirror_health',
+  ]);
+});
+
 test('4b API root listens before first mirror fetch and starts Feishu only behind readiness', async () => {
   const source = await readFile(new URL('../src/server.ts', import.meta.url), 'utf8');
   const listenAt = source.indexOf('await server.listen(apiPort())');
   const bootstrapAt = source.indexOf('await root.syncRead.consumer.bootstrap()');
   const businessAt = source.indexOf('await root.business.startIngress()');
+  const changedIngressAt = source.indexOf(
+    'registerApiSyncReadChangedIngress(\n    server,',
+  );
   assert.ok(listenAt >= 0 && bootstrapAt > listenAt);
   assert.ok(businessAt > listenAt);
+  assert.ok(
+    changedIngressAt >= 0 && changedIngressAt < listenAt,
+    'changed ingress must share the owner listener before consumer first load',
+  );
   assert.match(
     source,
     /root\.syncRead\.consumer\.readiness\(\)\.state !== 'ready'/,
   );
   assert.match(source, /root\.syncRead\.consumer\.startPeriodic\(/);
+  assert.match(source, /root\.syncRead\.consumer\.stop\(\)/);
+  assert.match(source, /await server\.close\(\)/);
+  assert.match(source, /await root\.pool\.end\(\)/);
+  assert.match(source, /if \(closePromise\) return closePromise/);
   assert.doesNotMatch(source, /resolveOwnerPgConfig\('automation'\)/);
   assert.equal((source.match(/new pg\.Pool\(/g) ?? []).length, 1);
 });

@@ -7,8 +7,10 @@ import {
   type SyncReadPayloadByStream,
 } from 'aidcp-kernel/kernel/sync-read-facts.js';
 import {
+  compareUnsignedSyncReadCursor,
   SyncReadConsumerCheckpointStore,
   type AtomicSyncReadMirror,
+  type SyncReadChangedStream,
   type SyncReadJson,
   type SyncReadMirrorHealth,
   type SyncReadProcessReadiness,
@@ -77,6 +79,10 @@ import {
   InternalHttpClient,
   InternalHttpServer,
 } from 'aidcp-transport/transport/internal-http.js';
+import {
+  registerSyncReadChangedRoute,
+  type SyncReadChangedIngress,
+} from 'aidcp-transport/transport/sync-read-changed-http.js';
 import {
   registerSyncReadSnapshotRoute,
   SyncReadSnapshotHttpClient,
@@ -155,6 +161,13 @@ export const API_SYNC_READ_CONSUMED_STREAMS = [
   'captcha_availability',
   'automation_config_mirror_health',
 ] as const satisfies readonly SyncReadStream[];
+
+export const API_SYNC_READ_CHANGED_STREAMS = [
+  'edge_presence',
+  'publish_in_flight',
+  'captcha_availability',
+  'automation_config_mirror_health',
+] as const satisfies readonly SyncReadChangedStream[];
 
 export const API_SYNC_READ_OWNED_STREAMS = [
   'account_persona',
@@ -282,10 +295,17 @@ export class ApiSyncReadConsumerRuntime {
     }
   }
 
-  async refreshStream(stream: ApiConsumedSyncReadStream): Promise<void> {
+  async refreshStream(
+    stream: ApiConsumedSyncReadStream,
+    minimumGeneration?: string,
+  ): Promise<void> {
     const active = this.streamRefreshes.get(stream);
-    if (active) return active;
-    const refresh = this.performRefresh(stream).finally(() => {
+    if (active) {
+      return minimumGeneration
+        ? active.then(() => this.refreshStream(stream, minimumGeneration))
+        : active;
+    }
+    const refresh = this.performRefresh(stream, minimumGeneration).finally(() => {
       if (this.streamRefreshes.get(stream) === refresh) {
         this.streamRefreshes.delete(stream);
       }
@@ -299,7 +319,10 @@ export class ApiSyncReadConsumerRuntime {
    * The periodic full cycle below remains authoritative and uses the same
    * per-stream serialization, so a missed wakeup cannot strand a delta.
    */
-  private async performRefresh(stream: ApiConsumedSyncReadStream): Promise<void> {
+  private async performRefresh(
+    stream: ApiConsumedSyncReadStream,
+    minimumGeneration?: string,
+  ): Promise<void> {
     const mirror = mirrorFor(this.mirrors, stream);
     try {
       const envelope = await this.snapshotClient.fetch(
@@ -307,6 +330,18 @@ export class ApiSyncReadConsumerRuntime {
         (value): value is SyncReadPayloadByStream[typeof stream] =>
           isSyncReadFactPayload(stream, value),
       );
+      if (
+        minimumGeneration
+        && compareUnsignedSyncReadCursor(
+          envelope.cursor,
+          minimumGeneration,
+        ) < 0
+      ) {
+        throw new Error(
+          `sync_read_snapshot_generation_behind stream=${stream} `
+            + `expected>=${minimumGeneration} actual=${envelope.cursor}`,
+        );
+      }
       const applied = this.mirrors.apply(envelope, 'owner_fetch');
       if (applied.outcome === 'rejected') {
         throw new Error(
@@ -1293,6 +1328,31 @@ export function registerApiSyncReadOwnerRoute(
   });
 }
 
+export function registerApiSyncReadChangedIngress(
+  server: InternalHttpServer,
+  consumer: Pick<ApiSyncReadConsumerRuntime, 'refreshStream'>,
+  target: DeploymentTarget,
+  bearerToken: string,
+): void {
+  const allowed = new Set<SyncReadChangedStream>(
+    API_SYNC_READ_CHANGED_STREAMS,
+  );
+  const ingress: SyncReadChangedIngress = {
+    async handle(signal) {
+      if (!allowed.has(signal.stream)) {
+        throw new Error(
+          `sync_read_changed_stream_not_consumed_by_api:${signal.stream}`,
+        );
+      }
+      await consumer.refreshStream(signal.stream, signal.generation);
+    },
+  };
+  registerSyncReadChangedRoute(server, ingress, {
+    executionTarget: target,
+    bearerToken,
+  });
+}
+
 function registerApiSyncReadReadinessRoute(
   server: InternalHttpServer,
   root: ApiCompositionRoot,
@@ -1326,6 +1386,12 @@ export async function startApiService(): Promise<{
     {
       snapshotFor: ({ stream }) => root.syncRead.ownerSource.snapshot(stream),
     },
+    root.target,
+    requiredEnv('AIDCP_API_INTERNAL_TOKEN'),
+  );
+  registerApiSyncReadChangedIngress(
+    server,
+    root.syncRead.consumer,
     root.target,
     requiredEnv('AIDCP_API_INTERNAL_TOKEN'),
   );
@@ -1419,7 +1485,8 @@ export async function startApiService(): Promise<{
   console.log(
     `[aidcp-api] API owner listener active on 127.0.0.1:${port} `
       + `(target=${root.target}; 16 owner route groups; 2 approval groups; `
-      + `1 sync-read owner snapshot group; 4 paired command clients; `
+      + `3 sync-read groups (snapshot/changed/readiness); `
+      + `4 paired command clients; `
       + `sync-read readiness=${root.syncRead.consumer.readiness().state}; `
       + `business ingress=${businessIngressStarted ? 'started' : 'blocked'})`,
   );
