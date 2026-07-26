@@ -36,8 +36,8 @@ import type {
   PublishApprovalDecisionWriterPort,
   PublishDispatchTriggerPort,
 } from 'aidcp-kernel/kernel/publish-approval-contract.js';
-import type { ScheduledAutomationCatalogReader } from 'aidcp-kernel/kernel/platform-types.js';
 import { resolveOwnerPgConfig } from 'aidcp-kernel/kernel/pg-owner-connection-resolver.js';
+import { SCHEDULED_AUTOMATION_CATALOG_READER } from 'aidcp-kernel/kernel/scheduled-automation-catalog.js';
 import {
   EdgeResumeCommandHttpClient,
   FacebookScopeCommandHttpClient,
@@ -310,18 +310,6 @@ const probeSchemaShape: SchemaProber = async (client, tables): Promise<SchemaSha
     columns: new Set(),
     indexes: new Set(),
   };
-};
-
-const unavailableScheduledCatalog: ScheduledAutomationCatalogReader = {
-  normalizeForCatalog(platform) {
-    return String(platform ?? '').trim();
-  },
-  availableActions() {
-    throw new Error('scheduled_automation_catalog_unavailable_in_api_service');
-  },
-  declarationsFor() {
-    throw new Error('scheduled_automation_catalog_unavailable_in_api_service');
-  },
 };
 
 function personaGeneratorFromCommand(
@@ -624,7 +612,7 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
   const contentSchedule = new ContentScheduleStore({
     pool,
     schemaEnsurer: migrationManagedSchema,
-    scheduledAutomationCatalog: unavailableScheduledCatalog,
+    scheduledAutomationCatalog: SCHEDULED_AUTOMATION_CATALOG_READER,
   });
   const facebookCommentConfig = new FacebookCommentConfigStore({
     pool,
