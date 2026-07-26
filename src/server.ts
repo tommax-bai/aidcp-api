@@ -2,6 +2,18 @@ import pg from 'pg';
 import { randomUUID } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 import { parseDeploymentTarget, type DeploymentTarget } from 'aidcp-kernel/deployment-target.js';
+import {
+  isSyncReadFactPayload,
+  type SyncReadPayloadByStream,
+} from 'aidcp-kernel/kernel/sync-read-facts.js';
+import {
+  SyncReadConsumerCheckpointStore,
+  type AtomicSyncReadMirror,
+  type SyncReadJson,
+  type SyncReadMirrorHealth,
+  type SyncReadProcessReadiness,
+  type SyncReadStream,
+} from 'aidcp-kernel/kernel/sync-read-snapshot.js';
 import type {
   AccountOwnershipAuthorityPort,
   AccountPersonaAuthorityPort,
@@ -66,6 +78,11 @@ import {
   InternalHttpServer,
 } from 'aidcp-transport/transport/internal-http.js';
 import {
+  registerSyncReadSnapshotRoute,
+  SyncReadSnapshotHttpClient,
+  type SyncReadSnapshotProvider,
+} from 'aidcp-transport/transport/sync-read-snapshot-http.js';
+import {
   registerPublishApprovalAuthorityRoutes,
 } from 'aidcp-transport/transport/publish-approval-authority-http.js';
 import {
@@ -88,6 +105,9 @@ import {
   ContentScheduleStore,
   createAutomationConfigCommands,
 } from './config/content-schedule-store.js';
+import { createApiSyncReadConsumerCheckpointStore } from './config/api-sync-read-checkpoint-store.js';
+import { ApiSyncReadMirrors } from './config/api-sync-read-mirrors.js';
+import { ApiSyncReadSnapshotSource } from './config/api-sync-read-source.js';
 import { FacebookCommentConfigStore } from './config/facebook-comment-config-store.js';
 import { createPersonaPanel } from './config/persona-facade.js';
 import { PersonaStore } from './config/persona-store.js';
@@ -121,8 +141,56 @@ import {
 } from './publish-agent/publish-approval-store.js';
 import { PublishLogStore } from './publish-agent/publish-log-store.js';
 import { createPublishUiUpdateProducer } from './publish-agent/publish-ui-update-producer.js';
+import { loadSoulFromYaml } from './soul/loader.js';
 
 const DEFAULT_API_PORT = 8094;
+export const API_SYNC_READ_FULL_REFRESH_MS = 30_000;
+export const API_SYNC_READ_READINESS_ROUTE =
+  'internal/api/sync-read/readiness';
+
+export const API_SYNC_READ_CONSUMED_STREAMS = [
+  'session_config_global',
+  'edge_presence',
+  'publish_in_flight',
+  'captcha_availability',
+  'automation_config_mirror_health',
+] as const satisfies readonly SyncReadStream[];
+
+export const API_SYNC_READ_OWNED_STREAMS = [
+  'account_persona',
+  'client_environment_automation',
+  'automation_account_projection',
+  'content_schedule',
+  'hot_lead_config',
+  'facebook_comment_config',
+  'facebook_group_join_automation_config',
+] as const satisfies readonly SyncReadStream[];
+
+type ApiConsumedSyncReadStream =
+  (typeof API_SYNC_READ_CONSUMED_STREAMS)[number];
+
+/**
+ * These DTO surfaces remain Cloud-panel owned after the API process split.
+ * The independent API root prepares narrow evidence ports, but does not
+ * pretend to own or start a second public panel listener.
+ */
+export const API_SYNC_READ_PUBLIC_SURFACE_LEDGER = Object.freeze([
+  {
+    surface: 'GET /api/dashboard/summary',
+    owner: 'cloud-panel',
+    adapter: 'edgePresenceEvidence',
+  },
+  {
+    surface: 'GET /api/content/queue',
+    owner: 'cloud-panel',
+    adapter: 'publishInFlightEvidence',
+  },
+  {
+    surface: 'GET /api/config-mirrors',
+    owner: 'cloud-panel',
+    adapter: 'configMirrorServicesHealth',
+  },
+] as const);
 
 interface ApiDirectAuthorities {
   accountRoster: AccountRosterAuthorityPort;
@@ -143,6 +211,285 @@ interface ApiDirectAuthorities {
   notificationDelivery: StructuredNotificationDeliveryPort;
 }
 
+export interface ApiSyncReadRefreshReport {
+  readiness: SyncReadProcessReadiness;
+  failures: ReadonlyArray<{
+    stream: ApiConsumedSyncReadStream;
+    message: string;
+  }>;
+}
+
+export interface ApiSyncReadSnapshotClient {
+  fetch<T extends SyncReadJson = SyncReadJson>(
+    stream: SyncReadStream,
+    validateValue?: (value: unknown) => value is T,
+  ): Promise<{
+    contractVersion: 1;
+    executionTarget: DeploymentTarget;
+    factScope: 'shared' | 'target';
+    stream: SyncReadStream;
+    cursor: string;
+    asOf: number;
+    freshUntil: number;
+    complete: true;
+    value: T;
+  }>;
+}
+
+export interface ApiSyncReadCheckpointPort {
+  load(stream: SyncReadStream): ReturnType<SyncReadConsumerCheckpointStore['load']>;
+  save(input: unknown): ReturnType<SyncReadConsumerCheckpointStore['save']>;
+}
+
+export class ApiSyncReadConsumerRuntime {
+  private refreshCycle: Promise<ApiSyncReadRefreshReport> | null = null;
+  private readonly streamRefreshes = new Map<
+    ApiConsumedSyncReadStream,
+    Promise<void>
+  >();
+  private timer: NodeJS.Timeout | null = null;
+
+  constructor(
+    readonly mirrors: ApiSyncReadMirrors,
+    private readonly checkpointStore: ApiSyncReadCheckpointPort,
+    private readonly snapshotClient: ApiSyncReadSnapshotClient,
+    private readonly logger: Pick<Console, 'warn'> = console,
+  ) {}
+
+  async restore(): Promise<void> {
+    for (const stream of API_SYNC_READ_CONSUMED_STREAMS) {
+      try {
+        const loaded = await this.checkpointStore.load(stream);
+        if (loaded.outcome === 'loaded') {
+          const restored = mirrorFor(this.mirrors, stream).restoreCheckpoint(
+            loaded.checkpoint,
+          );
+          if (restored.outcome === 'unknown') {
+            mirrorFor(this.mirrors, stream).beginRecovery(restored.message);
+          }
+          continue;
+        }
+        if (loaded.outcome === 'unknown') {
+          mirrorFor(this.mirrors, stream).beginRecovery(loaded.message);
+        }
+      } catch (error) {
+        mirrorFor(this.mirrors, stream).beginRecovery(
+          `checkpoint_restore_failed:${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+    }
+  }
+
+  async refreshStream(stream: ApiConsumedSyncReadStream): Promise<void> {
+    const active = this.streamRefreshes.get(stream);
+    if (active) return active;
+    const refresh = this.performRefresh(stream).finally(() => {
+      if (this.streamRefreshes.get(stream) === refresh) {
+        this.streamRefreshes.delete(stream);
+      }
+    });
+    this.streamRefreshes.set(stream, refresh);
+    return refresh;
+  }
+
+  /**
+   * A sync_read.changed delivery may call refreshStream for acceleration.
+   * The periodic full cycle below remains authoritative and uses the same
+   * per-stream serialization, so a missed wakeup cannot strand a delta.
+   */
+  private async performRefresh(stream: ApiConsumedSyncReadStream): Promise<void> {
+    const mirror = mirrorFor(this.mirrors, stream);
+    try {
+      const envelope = await this.snapshotClient.fetch(
+        stream,
+        (value): value is SyncReadPayloadByStream[typeof stream] =>
+          isSyncReadFactPayload(stream, value),
+      );
+      const applied = this.mirrors.apply(envelope, 'owner_fetch');
+      if (applied.outcome === 'rejected') {
+        throw new Error(
+          `sync_read_apply_failed stream=${stream} reason=${applied.reason}`,
+        );
+      }
+      if (applied.outcome === 'already_applied') return;
+      const saved = await this.checkpointStore.save(mirror.checkpoint());
+      if (saved.outcome === 'rejected') {
+        throw new Error(
+          `sync_read_checkpoint_save_failed stream=${stream} reason=${saved.reason}`,
+        );
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      mirror.beginRecovery(message);
+      throw error;
+    }
+  }
+
+  refreshAll(): Promise<ApiSyncReadRefreshReport> {
+    if (this.refreshCycle) return this.refreshCycle;
+    const cycle = (async (): Promise<ApiSyncReadRefreshReport> => {
+      const settled = await Promise.allSettled(
+        API_SYNC_READ_CONSUMED_STREAMS.map((stream) =>
+          this.refreshStream(stream),
+        ),
+      );
+      const failures = settled.flatMap((result, index) => {
+        if (result.status === 'fulfilled') return [];
+        return [{
+          stream: API_SYNC_READ_CONSUMED_STREAMS[index]!,
+          message:
+            result.reason instanceof Error
+              ? result.reason.message
+              : String(result.reason),
+        }];
+      });
+      return { readiness: this.readiness(), failures };
+    })();
+    this.refreshCycle = cycle.finally(() => {
+      this.refreshCycle = null;
+    });
+    return this.refreshCycle;
+  }
+
+  async bootstrap(): Promise<ApiSyncReadRefreshReport> {
+    await this.restore();
+    return this.refreshAll();
+  }
+
+  startPeriodic(
+    onCycle?: (report: ApiSyncReadRefreshReport) => void | Promise<void>,
+    intervalMs = API_SYNC_READ_FULL_REFRESH_MS,
+  ): void {
+    if (
+      !Number.isInteger(intervalMs)
+      || intervalMs <= 0
+      || intervalMs > API_SYNC_READ_FULL_REFRESH_MS
+    ) {
+      throw new Error(
+        `API sync-read refresh interval must be an integer in 1..${API_SYNC_READ_FULL_REFRESH_MS}`,
+      );
+    }
+    if (this.timer) return;
+    this.timer = setInterval(() => {
+      void this.refreshAll()
+        .then((report) => onCycle?.(report))
+        .catch((error) => {
+          this.logger.warn(
+            `[aidcp-api] sync-read periodic refresh failed: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        });
+    }, intervalMs);
+    this.timer.unref?.();
+  }
+
+  stop(): void {
+    if (this.timer) clearInterval(this.timer);
+    this.timer = null;
+  }
+
+  readiness(): SyncReadProcessReadiness {
+    return this.mirrors.readiness();
+  }
+
+  health(): {
+    readiness: SyncReadProcessReadiness;
+    streams: readonly SyncReadMirrorHealth[];
+  } {
+    return {
+      readiness: this.readiness(),
+      streams: API_SYNC_READ_CONSUMED_STREAMS.map((stream) =>
+        mirrorFor(this.mirrors, stream).health(),
+      ),
+    };
+  }
+}
+
+function mirrorFor(
+  mirrors: ApiSyncReadMirrors,
+  stream: ApiConsumedSyncReadStream,
+): AtomicSyncReadMirror<SyncReadJson> {
+  switch (stream) {
+    case 'session_config_global':
+      return mirrors.sessionConfig;
+    case 'edge_presence':
+      return mirrors.edgePresence;
+    case 'publish_in_flight':
+      return mirrors.publishInFlight;
+    case 'captcha_availability':
+      return mirrors.captchaAvailability;
+    case 'automation_config_mirror_health':
+      return mirrors.automationHealth;
+  }
+}
+
+export function createApiSyncReadPanelEvidencePorts(
+  mirrors: ApiSyncReadMirrors,
+): Pick<
+  PanelDeps,
+  | 'edgePresenceEvidence'
+  | 'publishInFlightEvidence'
+  | 'configMirrorServicesHealth'
+> {
+  return {
+    edgePresenceEvidence: () => {
+      const evidence = mirrors.presence();
+      return {
+        state: evidence.state,
+        asOf: evidence.asOf,
+        onlineEdgeCount: evidence.onlineEdgeCount,
+      };
+    },
+    publishInFlightEvidence: () => mirrors.inFlightEvidence(),
+    configMirrorServicesHealth: () => {
+      const api = mirrors.sessionConfig.health();
+      const automation = mirrors.automationConfigMirrorHealth();
+      const apiEntry =
+        api.deliveryState === 'fresh'
+          ? [{
+              mirrorKey: 'session_config_global',
+              tier: 'parameter' as const,
+              version: safeCursorNumber(api.appliedCursor),
+              lastComparedAt: api.lastObservedAt,
+              lastReloadedAt: api.lastAppliedAt,
+              reloadFailingSince: null,
+              state: 'fresh' as const,
+              staleMs: null,
+              observeStaleMs:
+                api.sourceAsOf === null || api.freshUntil === null
+                  ? 0
+                  : Math.max(0, api.freshUntil - api.sourceAsOf),
+              haltsOnStale: false,
+              staleForMs: 0,
+            }]
+          : [];
+      return {
+        services: [
+          {
+            sourceService: 'api',
+            asOf: api.sourceAsOf,
+            deliveryState: api.deliveryState,
+            entries: apiEntry,
+          },
+          {
+            ...automation,
+            entries: automation.entries.map((entry) => ({ ...entry })),
+          },
+        ],
+      };
+    },
+  };
+}
+
+function safeCursorNumber(cursor: string | null): number | null {
+  if (!cursor) return null;
+  const value = Number(cursor);
+  return Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
 interface ApiCompositionRoot {
   target: DeploymentTarget;
   pool: pg.Pool;
@@ -159,6 +506,14 @@ interface ApiCompositionRoot {
     facebookScope: FacebookScopeCommandPort;
     publishUi: PublishUiUpdateCommandPort;
     personaGenerator: PersonaGeneratorAuthorityPort;
+  };
+  syncRead: {
+    ownerSource: ApiSyncReadSnapshotSource;
+    consumer: ApiSyncReadConsumerRuntime;
+    panelEvidence: ReturnType<typeof createApiSyncReadPanelEvidencePorts>;
+  };
+  business: {
+    startIngress(): Promise<void>;
   };
 }
 
@@ -805,10 +1160,32 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
     managementChatIds,
     logger: console,
   });
-  await apiFeishu.startIngress({
-    commandFace,
-    ...publishOwnerHandlers.feishuApprovalIngress,
+  let businessIngressStarted = false;
+  const startBusinessIngress = async (): Promise<void> => {
+    if (businessIngressStarted) return;
+    await apiFeishu.startIngress({
+      commandFace,
+      ...publishOwnerHandlers.feishuApprovalIngress,
+    });
+    businessIngressStarted = true;
+  };
+
+  const syncReadOwnerSource = new ApiSyncReadSnapshotSource({
+    executionTarget: target,
+    pool,
+    parseSoul: (personaText) =>
+      JSON.parse(JSON.stringify(loadSoulFromYaml(personaText))) as SyncReadJson,
   });
+  const syncReadMirrors = new ApiSyncReadMirrors(target);
+  const syncReadConsumer = new ApiSyncReadConsumerRuntime(
+    syncReadMirrors,
+    createApiSyncReadConsumerCheckpointStore(pool, target),
+    new SyncReadSnapshotHttpClient(automationHttp, {
+      executionTarget: target,
+      bearerToken: automationToken,
+    }),
+    console,
+  );
 
   const authorities: ApiDirectAuthorities = {
     accountRoster: {
@@ -856,6 +1233,14 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
       decisionWriter: publishApprovalDecisionWriter,
       outboxRelay: publishApprovalOutboxRelay,
     },
+    syncRead: {
+      ownerSource: syncReadOwnerSource,
+      consumer: syncReadConsumer,
+      panelEvidence: createApiSyncReadPanelEvidencePorts(syncReadMirrors),
+    },
+    business: {
+      startIngress: startBusinessIngress,
+    },
   };
 }
 
@@ -894,14 +1279,65 @@ function registerApiAuthorityRoutes(
   );
 }
 
+export function registerApiSyncReadOwnerRoute(
+  server: InternalHttpServer,
+  provider: SyncReadSnapshotProvider,
+  target: DeploymentTarget,
+  bearerToken: string,
+): void {
+  registerSyncReadSnapshotRoute(server, provider, {
+    owner: 'api',
+    executionTarget: target,
+    bearerToken,
+    streams: API_SYNC_READ_OWNED_STREAMS,
+  });
+}
+
+function registerApiSyncReadReadinessRoute(
+  server: InternalHttpServer,
+  root: ApiCompositionRoot,
+  isBusinessIngressStarted: () => boolean,
+): void {
+  server.registerBearer(
+    API_SYNC_READ_READINESS_ROUTE,
+    requiredEnv('AIDCP_API_INTERNAL_TOKEN'),
+    async () => {
+      const health = root.syncRead.consumer.health();
+      return {
+        service: 'api',
+        executionTarget: root.target,
+        businessIngressStarted: isBusinessIngressStarted(),
+        ...health,
+      };
+    },
+  );
+}
+
 export async function startApiService(): Promise<{
   port: number;
+  readiness(): SyncReadProcessReadiness;
   close(): Promise<void>;
 }> {
   const root = await buildApiCompositionRoot();
   const server = new InternalHttpServer();
   registerApiAuthorityRoutes(server, root);
+  registerApiSyncReadOwnerRoute(
+    server,
+    {
+      snapshotFor: ({ stream }) => root.syncRead.ownerSource.snapshot(stream),
+    },
+    root.target,
+    requiredEnv('AIDCP_API_INTERNAL_TOKEN'),
+  );
+  let businessIngressStarted = false;
+  registerApiSyncReadReadinessRoute(
+    server,
+    root,
+    () => businessIngressStarted,
+  );
   const port = await server.listen(apiPort());
+  let publishApprovalRelayTimer: NodeJS.Timeout | null = null;
+  let closing = false;
   const pumpPublishApprovalOutbox = (): void => {
     void root.publishApproval.outboxRelay.runOnce(20).catch((error) => {
       console.warn(
@@ -911,21 +1347,86 @@ export async function startApiService(): Promise<{
       );
     });
   };
-  const publishApprovalRelayTimer = setInterval(pumpPublishApprovalOutbox, 60_000);
-  publishApprovalRelayTimer.unref?.();
-  pumpPublishApprovalOutbox();
+  let businessStart: Promise<void> | null = null;
+  const startBusinessIfReady = async (): Promise<void> => {
+    if (
+      closing
+      || businessIngressStarted
+      || root.syncRead.consumer.readiness().state !== 'ready'
+    ) {
+      return;
+    }
+    if (!businessStart) {
+      businessStart = (async () => {
+        await root.business.startIngress();
+        businessIngressStarted = true;
+        if (closing) return;
+        publishApprovalRelayTimer = setInterval(
+          pumpPublishApprovalOutbox,
+          60_000,
+        );
+        publishApprovalRelayTimer.unref?.();
+        pumpPublishApprovalOutbox();
+      })().finally(() => {
+        businessStart = null;
+      });
+    }
+    await businessStart;
+  };
+  let closePromise: Promise<void> | null = null;
+  const stopService = (): Promise<void> => {
+    if (closePromise) return closePromise;
+    closing = true;
+    closePromise = (async () => {
+      root.syncRead.consumer.stop();
+      const activeBusinessStart = businessStart;
+      if (activeBusinessStart) {
+        await activeBusinessStart.catch(() => undefined);
+      }
+      if (publishApprovalRelayTimer) {
+        clearInterval(publishApprovalRelayTimer);
+        publishApprovalRelayTimer = null;
+      }
+      await server.close();
+      await root.pool.end();
+    })();
+    return closePromise;
+  };
+  try {
+    const initial = await root.syncRead.consumer.bootstrap();
+    if (initial.failures.length > 0) {
+      console.warn(
+        `[aidcp-api] sync-read first load incomplete; listener remains live and business ingress stays blocked: ${
+          initial.failures.map((failure) => `${failure.stream}=${failure.message}`).join('; ')
+        }`,
+      );
+    }
+    await startBusinessIfReady();
+    root.syncRead.consumer.startPeriodic(async (report) => {
+      if (report.failures.length > 0) {
+        console.warn(
+          `[aidcp-api] sync-read periodic full snapshot incomplete: ${
+            report.failures.map((failure) => `${failure.stream}=${failure.message}`).join('; ')
+          }`,
+        );
+      }
+      await startBusinessIfReady();
+    });
+  } catch (error) {
+    await stopService();
+    throw error;
+  }
   console.log(
-    `[aidcp-api] API owner composition ready on 127.0.0.1:${port} `
+    `[aidcp-api] API owner listener active on 127.0.0.1:${port} `
       + `(target=${root.target}; 16 owner route groups; 2 approval groups; `
-      + `4 paired command clients; panel Facebook scope consumer ready)`,
+      + `1 sync-read owner snapshot group; 4 paired command clients; `
+      + `sync-read readiness=${root.syncRead.consumer.readiness().state}; `
+      + `business ingress=${businessIngressStarted ? 'started' : 'blocked'})`,
   );
   return {
     port,
-    async close() {
-      clearInterval(publishApprovalRelayTimer);
-      await server.close();
-      await root.pool.end();
-    },
+    readiness: () => root.syncRead.consumer.readiness(),
+    close: stopService,
   };
 }
 
