@@ -29,7 +29,13 @@ import type {
   SchemaProber,
   SchemaShape,
 } from 'aidcp-kernel/kernel/schema-capability-contract.js';
+import type { FacebookGroupOpsPort } from 'aidcp-kernel/kernel/facebook-group-ops-types.js';
 import type { PersonaGeneratorPort } from 'aidcp-kernel/kernel/persona-ports.js';
+import type {
+  PublishApprovalAuthorityPort,
+  PublishApprovalDecisionWriterPort,
+  PublishDispatchTriggerPort,
+} from 'aidcp-kernel/kernel/publish-approval-contract.js';
 import type { ScheduledAutomationCatalogReader } from 'aidcp-kernel/kernel/platform-types.js';
 import { resolveOwnerPgConfig } from 'aidcp-kernel/kernel/pg-owner-connection-resolver.js';
 import {
@@ -54,10 +60,20 @@ import {
   registerReplyConfigResolverRoutes,
   registerStructuredNotificationRoutes,
 } from 'aidcp-transport/transport/api-direct-http.js';
+import { FacebookGroupOpsHttpClient } from 'aidcp-transport/transport/facebook-group-ops-http.js';
 import {
   InternalHttpClient,
   InternalHttpServer,
 } from 'aidcp-transport/transport/internal-http.js';
+import {
+  registerPublishApprovalAuthorityRoutes,
+} from 'aidcp-transport/transport/publish-approval-authority-http.js';
+import {
+  registerPublishApprovalDecisionWriterRoutes,
+} from 'aidcp-transport/transport/publish-approval-decision-http.js';
+import {
+  PublishDispatchTriggerHttpClient,
+} from 'aidcp-transport/transport/publish-dispatch-trigger-http.js';
 import { PgAccountStore } from './account-store.js';
 import { AccountStateManager } from './account-state.js';
 import { NotificationContactStore } from './cache/notification-contact-store.js';
@@ -75,12 +91,34 @@ import {
 import { FacebookCommentConfigStore } from './config/facebook-comment-config-store.js';
 import { createPersonaPanel } from './config/persona-facade.js';
 import { PersonaStore } from './config/persona-store.js';
-import type { ApiFeishuOwner } from './feishu/api-owner-composition.js';
+import type {
+  ApiFeishuOwner,
+  StartApiFeishuIngressInput,
+} from './feishu/api-owner-composition.js';
+import type { PublishApprovalPreflightResult } from './feishu/ws-receiver.js';
 import { PgInteractionAuthGate } from './interactions/interaction-auth-gate.js';
 import { PgInteractionApiWrites } from './interactions/interaction-api-writes.js';
 import { ReplyConfigResolver } from './interactions/reply-config-resolver.js';
 import { ReplyConfigScopeStore } from './interactions/reply-config-scope-store.js';
 import { FirstPostOnboardingStore } from './onboarding/first-post-onboarding-store.js';
+import type { PanelDeps } from './panel/types.js';
+import { createClientPublishApprovalHandler } from './publish-agent/client-publish-approval.js';
+import { createPublishDraftImageRemoveHandler } from './publish-agent/draft-image-remove.js';
+import {
+  createPublishApprovalAuthorityService,
+  createPublishApprovalClient,
+  createPublishApprovalDecisionWriter,
+  type PublishApprovalClient,
+} from './publish-agent/publish-approval-api.js';
+import { PublishApprovalOutboxRelay } from './publish-agent/publish-approval-outbox-relay.js';
+import {
+  createApprovalWriteOutlet,
+  type ApprovalWriteOutlet,
+} from './publish-agent/publish-approval-outlet.js';
+import {
+  PUBLISH_APPROVAL_SCHEMA_SQL,
+  PublishApprovalStore,
+} from './publish-agent/publish-approval-store.js';
 import { PublishLogStore } from './publish-agent/publish-log-store.js';
 import { createPublishUiUpdateProducer } from './publish-agent/publish-ui-update-producer.js';
 
@@ -110,6 +148,12 @@ interface ApiCompositionRoot {
   pool: pg.Pool;
   authorities: ApiDirectAuthorities;
   apiFeishu: ApiFeishuOwner;
+  panelFacebookGroupTargets: NonNullable<PanelDeps['facebookGroupTargets']>;
+  publishApproval: {
+    authority: PublishApprovalAuthorityPort;
+    decisionWriter: PublishApprovalDecisionWriterPort;
+    outboxRelay: PublishApprovalOutboxRelay;
+  };
   pairedCommands: {
     edgeResume: EdgeResumeCommandPort;
     facebookScope: FacebookScopeCommandPort;
@@ -296,6 +340,177 @@ function personaGeneratorFromCommand(
   };
 }
 
+export function createApiPanelFacebookGroupTargets(
+  reads: FacebookGroupOpsPort,
+  commands: FacebookScopeCommandPort,
+  commandId: () => string = randomUUID,
+): NonNullable<PanelDeps['facebookGroupTargets']> {
+  return {
+    async importTargets(inputs, importBatch, options) {
+      const receipt = await commands.importTargets({
+        commandId: commandId(),
+        inputs,
+        importBatch,
+        ...(options ? { options } : {}),
+      });
+      if (receipt.outcome === 'collision') {
+        throw new Error('facebook_scope_command_collision');
+      }
+      return receipt.result;
+    },
+    listTargets: (options) => reads.listTargets(options),
+    listFacets: () => reads.listFacets(),
+    setEnabled: (groupUrl, enabled) => reads.setEnabled(groupUrl, enabled),
+    async replaceTargetScopes(groupUrls, accountGroupLabels, updatedBy) {
+      const receipt = await commands.replaceTargetScopes({
+        commandId: commandId(),
+        groupUrls,
+        accountGroupLabels,
+        updatedBy,
+      });
+      if (receipt.outcome === 'collision') {
+        throw new Error('facebook_scope_command_collision');
+      }
+      return receipt.result;
+    },
+    accountProgress: () => reads.accountProgress(),
+    listAssignments: (limit) => reads.listAssignments(limit),
+    reclaimStaleAssignments: (ttlMs) => reads.reclaimStaleAssignments(ttlMs),
+  };
+}
+
+interface ApiPublishOwnerHandlerDeps {
+  publishLog: Pick<
+    AutomationPublishLogPort,
+    'loadForDispatch' | 'editDraft' | 'rejectPendingApproval'
+  >;
+  approvalClient: Pick<PublishApprovalClient, 'readApproval'>;
+  writeApprovalDecision: ApprovalWriteOutlet;
+  triggerApproved(
+    requestId: string,
+    revision: number,
+    kind: 'human_reconfirm',
+  ): Promise<void>;
+  publishUi: Pick<ReturnType<typeof createPublishUiUpdateProducer>, 'pushPreview'>;
+  logger?: Pick<Console, 'warn'>;
+}
+
+export function createApiPublishOwnerHandlers(
+  deps: ApiPublishOwnerHandlerDeps,
+): {
+  edgePublish: EdgePublishCommandPort;
+  feishuApprovalIngress: Omit<
+    StartApiFeishuIngressInput,
+    'commandFace' | 'delegatedTasks'
+  >;
+} {
+  const logger = deps.logger ?? console;
+  const readLiveContentVersion = async (recordId: number): Promise<number | null> => {
+    const draft = await deps.publishLog.loadForDispatch(recordId);
+    return draft?.contentVersion ?? null;
+  };
+  const preflightApprovePublish = async (
+    requestId: string,
+  ): Promise<PublishApprovalPreflightResult> => {
+    const match = /^publish-(\d+)$/.exec(requestId);
+    if (!match) return { ok: true };
+    const draft = await deps.publishLog.loadForDispatch(Number(match[1]));
+    return draft
+      ? { ok: true, accountId: draft.accountId }
+      : { ok: false, reason: 'publish_target_unavailable' };
+  };
+  const refreshPreview = (recordId: number): void => {
+    void deps.publishUi.pushPreview(recordId).catch((error) => {
+      logger.warn(
+        `[publish-ui-update] API draft action preview delivery failed recordId=${recordId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    });
+  };
+  const triggerApproved = (trigger: {
+    requestId: string;
+    revision: number;
+    kind: 'human_reconfirm';
+  }): void => {
+    void deps
+      .triggerApproved(trigger.requestId, trigger.revision, trigger.kind)
+      .catch((error) => {
+        logger.warn(
+          `[aidcp-api] human_reconfirm trigger failed requestId=${trigger.requestId}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      });
+  };
+  const notifyRejected = (requestId: string): void => {
+    const match = /^publish-(\d+)$/.exec(requestId);
+    if (!match) return;
+    void deps.publishLog.rejectPendingApproval(Number(match[1])).catch((error) => {
+      logger.warn(
+        `[aidcp-api] publish rejection materialization failed requestId=${requestId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    });
+  };
+
+  const removeDraftImage = createPublishDraftImageRemoveHandler({
+    loadDraft: (recordId) => deps.publishLog.loadForDispatch(recordId),
+    readApproval: (requestId) => deps.approvalClient.readApproval(requestId),
+    editDraft: (recordId, expectedVersion, patch, editor) =>
+      deps.publishLog.editDraft(recordId, expectedVersion, patch, editor),
+    readLiveVersion: readLiveContentVersion,
+    refreshPreview,
+    logger,
+  });
+  const decidePublishApproval = createClientPublishApprovalHandler({
+    loadDraft: (recordId) => deps.publishLog.loadForDispatch(recordId),
+    readApproval: (requestId) => deps.approvalClient.readApproval(requestId),
+    editDraft: (recordId, expectedVersion, patch, editor) =>
+      deps.publishLog.editDraft(recordId, expectedVersion, patch, editor),
+    preflight: preflightApprovePublish,
+    writeApproval: (requestId, approved, payload, decidedBy) =>
+      deps.writeApprovalDecision(requestId, approved, payload, {
+        decidedBy: `client:${decidedBy}`,
+        decidedVia: 'client',
+      }),
+    triggerApproved,
+    notifyRejected,
+    readDispatchState: async (requestId) => {
+      const row = await deps.approvalClient.readApproval(requestId);
+      if (!row || !row.approved) return null;
+      if (row.dispatchState === 'dispatching') {
+        return { dispatchState: 'dispatching' as const };
+      }
+      if (row.dispatchState !== 'pending_dispatch') return null;
+      return row.dispatchBlockedReason
+        ? {
+            dispatchState: 'blocked' as const,
+            dispatchBlockedReason: row.dispatchBlockedReason,
+          }
+        : { dispatchState: 'pending_dispatch' as const };
+    },
+    logger,
+  });
+
+  return {
+    edgePublish: {
+      removeDraftImage: (input) => removeDraftImage(input.payload, input.session),
+      decidePublishApproval: (input) =>
+        decidePublishApproval(input.payload, input.accountId),
+    },
+    feishuApprovalIngress: {
+      writeApproval: (requestId, approved, payload, context) =>
+        deps.writeApprovalDecision(requestId, approved, payload, context),
+      onApproved: triggerApproved,
+      onRejected: notifyRejected,
+      readLiveContentVersion,
+      preflightApprovePublish,
+    },
+  };
+}
+
 async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
   const mode = process.env.AIDCP_SERVICE?.trim();
   if (mode && mode !== 'api') {
@@ -307,6 +522,7 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
   const contentHttp = new InternalHttpClient(requiredUrl('AIDCP_CONTENT_URL'));
   const automationToken = requiredEnv('AIDCP_AUTOMATION_INTERNAL_TOKEN');
   const contentToken = requiredEnv('AIDCP_CONTENT_INTERNAL_TOKEN');
+  const publishApprovalToken = requiredEnv('AIDCP_PUBLISH_APPROVAL_INTERNAL_TOKEN');
 
   const accountStore = new PgAccountStore({
     pool,
@@ -348,6 +564,10 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
     schemaEnsurer: migrationManagedSchema,
   });
   const replyScopes = new ReplyConfigScopeStore({ pool });
+  const publishApprovalStore = new PublishApprovalStore({
+    pool,
+    executionTarget: target,
+  });
 
   await Promise.all([
     accountStore.init(),
@@ -360,6 +580,11 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
     facebookCommentConfig.init(),
     personaStore.init(),
     replyScopes.init(),
+    migrationManagedSchema(pool, {
+      capability: 'publish_approval',
+      sinceVersion: '0063_publish_approval_decision',
+      ddl: [PUBLISH_APPROVAL_SCHEMA_SQL],
+    }),
   ]);
   const accountState = new AccountStateManager(accountStore);
   await accountState.init();
@@ -370,69 +595,6 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
     publishUi: new PublishUiUpdateCommandHttpClient(automationHttp, automationToken, target),
     personaGenerator: new PersonaGeneratorCommandHttpClient(contentHttp, contentToken, target),
   };
-
-  const { createApiFeishuOwner } = await import('./feishu/api-owner-composition.js');
-  const apiFeishu = createApiFeishuOwner({
-    pool,
-    accountStore,
-    accountDisplayName: (accountId) => accountStore.getDisplayName(accountId).name,
-    deploymentTarget: target,
-    fallbackChatId: process.env.FEISHU_CHAT_ID,
-    logger: console,
-  });
-  const managementChatIds = new Set(
-    (process.env.FEISHU_MANAGEMENT_CHAT_IDS ?? '')
-      .split(',')
-      .map((value) => value.trim())
-      .filter(Boolean),
-  );
-  const commandFace = apiFeishu.createCommandFace({
-    account: {
-      async requireCommandAccount(accountId) {
-        if (accountId?.trim()) return accountId.trim();
-        const rows = await accountStore.listAccountIdentities();
-        if (rows.length !== 1) {
-          throw new Error(`command_account_ambiguous:${rows.length}`);
-        }
-        return rows[0].accountId;
-      },
-      getStatus: (accountId) => accountState.getStatus(accountId),
-      pause: (accountId) => accountState.pause(accountId),
-      resume: (accountId) => accountState.resume(accountId),
-      async resumeEdgesForAccount(accountId) {
-        const receipt = await pairedCommands.edgeResume.resumeEdgesForAccount({
-          commandId: `api-feishu-resume:${accountId}:${randomUUID()}`,
-          accountId,
-        });
-        if (receipt.outcome === 'collision') {
-          return { state: 'unknown', reason: 'edge_resume_command_collision' };
-        }
-        return { state: 'applied', resumedEdges: receipt.resumedEdges };
-      },
-    },
-    bindChat: (record) => apiFeishu.botChatStore.setDefault(record),
-    delegate: async () => {
-      throw new Error('automation_operator_command_unavailable:delegate');
-    },
-    publish: async () => {
-      throw new Error('automation_operator_command_unavailable:publish');
-    },
-    comment: async () => {
-      throw new Error('automation_operator_command_unavailable:comment');
-    },
-    dispatch: async () => {
-      throw new Error('automation_operator_command_unavailable:dispatch');
-    },
-    dispatchActive: () => false,
-    managementChatIds,
-    logger: console,
-  });
-  await apiFeishu.startIngress({
-    commandFace,
-    writeApproval: async () => {
-      throw new Error('publish_approval_writer_unavailable_in_api_service');
-    },
-  });
 
   const personaPanel = createPersonaPanel({ store: personaStore });
   const accountPersona = new AccountPersonaService({
@@ -517,14 +679,143 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
       publishLogStore.countPublishedSinceForAccount(accountId, since),
   };
 
-  const edgePublish: EdgePublishCommandPort = {
-    removeDraftImage: async () => {
-      throw new Error('edge_publish_image_remove_handler_unavailable_in_api_service');
+  const publishApprovalAuthority = createPublishApprovalAuthorityService(
+    publishApprovalStore,
+    target,
+  );
+  const publishApprovalClient = createPublishApprovalClient(
+    publishApprovalAuthority,
+    target,
+  );
+  const publishDispatchTrigger: PublishDispatchTriggerPort =
+    new PublishDispatchTriggerHttpClient(automationHttp, publishApprovalToken);
+  const publishApprovalOutboxRelay = new PublishApprovalOutboxRelay({
+    executionTarget: target,
+    store: publishApprovalStore,
+    trigger: publishDispatchTrigger,
+    logger: console,
+  });
+  const approvalWriteOutlet = createApprovalWriteOutlet({
+    store: publishApprovalStore,
+    resolveEnvKey: async ({ subjectKind, candidateRef }) => {
+      if (subjectKind !== 'publish') return null;
+      const recordId = Number(candidateRef);
+      if (!Number.isInteger(recordId) || recordId <= 0) return null;
+      const draft = await publishLogStore.loadForDispatch(recordId);
+      return draft ? clientUserStore.envKeyForAccount(draft.accountId) : null;
     },
-    decidePublishApproval: async () => {
-      throw new Error('edge_publish_approval_handler_unavailable_in_api_service');
-    },
+    logger: console,
+  });
+  const writeApprovalDecision: ApprovalWriteOutlet = async (
+    requestId,
+    approved,
+    payload,
+    context,
+  ) => {
+    const result = await approvalWriteOutlet(
+      requestId,
+      approved,
+      payload,
+      context,
+    );
+    if (approved && result.written) {
+      void publishApprovalOutboxRelay.runOnce(20).catch((error) => {
+        console.warn(
+          `[aidcp-api] PublishApproved outbox wake failed requestId=${requestId}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      });
+    }
+    return result;
   };
+  const publishApprovalDecisionWriter = createPublishApprovalDecisionWriter(
+    writeApprovalDecision,
+    target,
+  );
+  const publishOwnerHandlers = createApiPublishOwnerHandlers({
+    publishLog,
+    approvalClient: publishApprovalClient,
+    writeApprovalDecision,
+    triggerApproved: async (requestId, revision, kind) => {
+      await publishDispatchTrigger.triggerApproved({
+        requestId,
+        revision,
+        executionTarget: target,
+        kind,
+      });
+    },
+    publishUi,
+    logger: console,
+  });
+  const edgePublish = publishOwnerHandlers.edgePublish;
+
+  const panelFacebookGroupTargets = createApiPanelFacebookGroupTargets(
+    new FacebookGroupOpsHttpClient(automationHttp),
+    pairedCommands.facebookScope,
+  );
+
+  const { createApiFeishuOwner } = await import('./feishu/api-owner-composition.js');
+  const apiFeishu = createApiFeishuOwner({
+    pool,
+    accountStore,
+    accountDisplayName: (accountId) => accountStore.getDisplayName(accountId).name,
+    publishApprovalDecisionWriter,
+    deploymentTarget: target,
+    fallbackChatId: process.env.FEISHU_CHAT_ID,
+    logger: console,
+  });
+  const managementChatIds = new Set(
+    (process.env.FEISHU_MANAGEMENT_CHAT_IDS ?? '')
+      .split(',')
+      .map((value) => value.trim())
+      .filter(Boolean),
+  );
+  const commandFace = apiFeishu.createCommandFace({
+    account: {
+      async requireCommandAccount(accountId) {
+        if (accountId?.trim()) return accountId.trim();
+        const rows = await accountStore.listAccountIdentities();
+        if (rows.length !== 1) {
+          throw new Error(`command_account_ambiguous:${rows.length}`);
+        }
+        return rows[0].accountId;
+      },
+      getStatus: (accountId) => accountState.getStatus(accountId),
+      pause: (accountId) => accountState.pause(accountId),
+      resume: (accountId) => accountState.resume(accountId),
+      async resumeEdgesForAccount(accountId) {
+        const receipt = await pairedCommands.edgeResume.resumeEdgesForAccount({
+          commandId: `api-feishu-resume:${accountId}:${randomUUID()}`,
+          accountId,
+        });
+        if (receipt.outcome === 'collision') {
+          return { state: 'unknown', reason: 'edge_resume_command_collision' };
+        }
+        return { state: 'applied', resumedEdges: receipt.resumedEdges };
+      },
+    },
+    bindChat: (record) => apiFeishu.botChatStore.setDefault(record),
+    delegate: async () => {
+      throw new Error('automation_operator_command_unavailable:delegate');
+    },
+    publish: async () => {
+      throw new Error('automation_operator_command_unavailable:publish');
+    },
+    comment: async () => {
+      throw new Error('automation_operator_command_unavailable:comment');
+    },
+    dispatch: async () => {
+      throw new Error('automation_operator_command_unavailable:dispatch');
+    },
+    dispatchActive: () => false,
+    managementChatIds,
+    logger: console,
+  });
+  await apiFeishu.startIngress({
+    commandFace,
+    ...publishOwnerHandlers.feishuApprovalIngress,
+  });
 
   const authorities: ApiDirectAuthorities = {
     accountRoster: {
@@ -560,7 +851,19 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
     notificationDelivery: apiFeishu.notificationDelivery,
   };
 
-  return { target, pool, authorities, apiFeishu, pairedCommands };
+  return {
+    target,
+    pool,
+    authorities,
+    apiFeishu,
+    pairedCommands,
+    panelFacebookGroupTargets,
+    publishApproval: {
+      authority: publishApprovalAuthority,
+      decisionWriter: publishApprovalDecisionWriter,
+      outboxRelay: publishApprovalOutboxRelay,
+    },
+  };
 }
 
 function registerApiAuthorityRoutes(
@@ -585,6 +888,17 @@ function registerApiAuthorityRoutes(
   registerAutomationConfigCommandsRoutes(server, port.automationConfigCommands, token, target);
   registerOffboardAdmissionLedgerRoutes(server, port.offboardAdmissionLedger, token, target);
   registerStructuredNotificationRoutes(server, port.notificationDelivery, token, target);
+  const publishApprovalToken = requiredEnv('AIDCP_PUBLISH_APPROVAL_INTERNAL_TOKEN');
+  registerPublishApprovalAuthorityRoutes(
+    server,
+    root.publishApproval.authority,
+    publishApprovalToken,
+  );
+  registerPublishApprovalDecisionWriterRoutes(
+    server,
+    root.publishApproval.decisionWriter,
+    publishApprovalToken,
+  );
 }
 
 export async function startApiService(): Promise<{
@@ -595,13 +909,27 @@ export async function startApiService(): Promise<{
   const server = new InternalHttpServer();
   registerApiAuthorityRoutes(server, root);
   const port = await server.listen(apiPort());
+  const pumpPublishApprovalOutbox = (): void => {
+    void root.publishApproval.outboxRelay.runOnce(20).catch((error) => {
+      console.warn(
+        `[aidcp-api] PublishApproved outbox relay failed; commands remain pending: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    });
+  };
+  const publishApprovalRelayTimer = setInterval(pumpPublishApprovalOutbox, 60_000);
+  publishApprovalRelayTimer.unref?.();
+  pumpPublishApprovalOutbox();
   console.log(
     `[aidcp-api] API owner composition ready on 127.0.0.1:${port} `
-      + `(target=${root.target}; 16 owner route groups; 4 paired command clients)`,
+      + `(target=${root.target}; 16 owner route groups; 2 approval groups; `
+      + `4 paired command clients; panel Facebook scope consumer ready)`,
   );
   return {
     port,
     async close() {
+      clearInterval(publishApprovalRelayTimer);
       await server.close();
       await root.pool.end();
     },
