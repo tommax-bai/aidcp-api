@@ -9,6 +9,7 @@
     { "table": "account_facebook_publish_image_set", "owner": "content", "basis": "§5.1「媒体资产和处理尝试」→ aidcp-content" },
     { "table": "account_reply_profiles", "owner": "api", "basis": "§5.1「互动域配置与查询面（account_reply_profiles）」→ aidcp-api" },
     { "table": "accounts", "owner": "api", "basis": "§5.1「账号主数据（accounts）」→ aidcp-api 单写" },
+    { "table": "api_sync_read_consumer_checkpoint", "owner": "api", "basis": "change split-cloud-api-composition-root-4b 新增（migrations/0082）。api consumer 本地持久化 target-scoped sync-read cursor/readiness/health；不保存 automation owner payload 或共享业务 version，唯一运行时写入方 src/config/api-sync-read-checkpoint-store.ts 属 api。" },
     { "table": "alerts", "owner": "automation", "basis": "§5.1「告警（alerts）」→ aidcp-automation；api MUST NOT UPDATE" },
     { "table": "anchor_staging", "owner": "automation", "basis": "§5.1 未具名；锚点主缓存，写入方 src/cache/pg-anchor-cache.ts 属 automation（§4.7 cache 逐文件表）" },
     { "table": "anchors", "owner": "automation", "basis": "§5.1 未具名；同上" },

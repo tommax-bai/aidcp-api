@@ -22,8 +22,8 @@
   },
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.66.0",
-    "aidcp-kernel": "git+ssh://git@github.com/tommax-bai/aidcp-kernel.git#8d5378d35d896f62270952199f9bc27c9e1e4793",
-    "aidcp-transport": "git+ssh://git@github.com/tommax-bai/aidcp-transport.git#03c67dc288baebee85d45681fa25bd87b9e44e30",
+    "aidcp-kernel": "git+ssh://git@github.com/tommax-bai/aidcp-kernel.git#a52c16fd2ca1bb415f5e3906ba794bccf77a9171",
+    "aidcp-transport": "git+ssh://git@github.com/tommax-bai/aidcp-transport.git#be70f7c8126a94495822848fbe47efa0e0ea9e66",
     "pg": "^8.13.1",
     "ws": "^8.18.0"
   },

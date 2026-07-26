@@ -23,6 +23,9 @@ import type {
   HotLeadConfigPatchInput,
   ResumeConfigPatchInput,
   DashboardSummary,
+  PanelConfigMirrorHealthResponse,
+  PanelEvidenceState,
+  PanelPublishInFlightEvidence,
 } from './types.js';
 import { startPanelWs, type PanelWsHandle } from './panel-ws.js';
 import type { PublishApprovalPayload } from '../feishu/index.js';
@@ -71,6 +74,210 @@ function sendJson(res: http.ServerResponse, status: number, body: unknown): void
   res.statusCode = status;
   res.setHeader('content-type', 'application/json; charset=utf-8');
   res.end(buf);
+}
+
+const EVIDENCE_STATES = new Set<PanelEvidenceState>(['fresh', 'unknown', 'stale', 'invalid']);
+
+function evidenceAsOf(value: number | null): number | null {
+  return value === null || (Number.isFinite(value) && value >= 0) ? value : null;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function hasExactlyKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  const actual = Object.keys(value).sort();
+  const expected = [...keys].sort();
+  return actual.length === expected.length && actual.every((key, index) => key === expected[index]);
+}
+
+function isNullableNonNegativeNumber(value: unknown): value is number | null {
+  return value === null || (typeof value === 'number' && Number.isFinite(value) && value >= 0);
+}
+
+const CONFIG_MIRROR_ENTRY_KEYS = [
+  'mirrorKey',
+  'tier',
+  'version',
+  'lastComparedAt',
+  'lastReloadedAt',
+  'reloadFailingSince',
+  'state',
+  'staleMs',
+  'observeStaleMs',
+  'haltsOnStale',
+  'staleForMs',
+] as const;
+
+function isConfigMirrorHealthEntry(value: unknown): boolean {
+  if (!isRecord(value) || !hasExactlyKeys(value, CONFIG_MIRROR_ENTRY_KEYS)) return false;
+  return typeof value.mirrorKey === 'string'
+    && value.mirrorKey.trim().length > 0
+    && (value.tier === 'gate' || value.tier === 'parameter')
+    && (value.version === null
+      || (typeof value.version === 'number' && Number.isInteger(value.version) && value.version >= 0))
+    && isNullableNonNegativeNumber(value.lastComparedAt)
+    && isNullableNonNegativeNumber(value.lastReloadedAt)
+    && isNullableNonNegativeNumber(value.reloadFailingSince)
+    && (value.state === 'fresh' || value.state === 'stale')
+    && isNullableNonNegativeNumber(value.staleMs)
+    && typeof value.observeStaleMs === 'number'
+    && Number.isFinite(value.observeStaleMs)
+    && value.observeStaleMs >= 0
+    && typeof value.haltsOnStale === 'boolean'
+    && typeof value.staleForMs === 'number'
+    && Number.isFinite(value.staleForMs)
+    && value.staleForMs >= 0;
+}
+
+function invalidConfigMirrorServices(): PanelConfigMirrorHealthResponse {
+  return {
+    services: [
+      { sourceService: 'api', asOf: null, deliveryState: 'invalid', entries: [] },
+      { sourceService: 'automation', asOf: null, deliveryState: 'invalid', entries: [] },
+    ],
+  };
+}
+
+function readEdgePresenceEvidence(deps: PanelDeps, now: number): {
+  state: PanelEvidenceState;
+  asOf: number | null;
+  onlineEdgeCount: number | null;
+} {
+  if (!deps.edgePresenceEvidence) {
+    const count = deps.edgeServer.onlineEdgeCount();
+    return Number.isInteger(count) && count >= 0
+      ? { state: 'fresh', asOf: now, onlineEdgeCount: count }
+      : { state: 'invalid', asOf: now, onlineEdgeCount: null };
+  }
+  const evidence = deps.edgePresenceEvidence();
+  const asOf = evidenceAsOf(evidence.asOf);
+  if (!EVIDENCE_STATES.has(evidence.state)) {
+    return { state: 'invalid', asOf, onlineEdgeCount: null };
+  }
+  if (
+    evidence.state !== 'fresh'
+    || asOf === null
+    || !Number.isInteger(evidence.onlineEdgeCount)
+    || (evidence.onlineEdgeCount ?? -1) < 0
+  ) {
+    return {
+      state: evidence.state === 'fresh' ? 'invalid' : evidence.state,
+      asOf,
+      onlineEdgeCount: null,
+    };
+  }
+  return { state: 'fresh', asOf, onlineEdgeCount: evidence.onlineEdgeCount };
+}
+
+function readPublishInFlightEvidence(deps: PanelDeps, now: number): PanelPublishInFlightEvidence {
+  if (!deps.publishInFlightEvidence) {
+    if (!deps.publishDispatcher) return { state: 'unknown', asOf: null, recordIds: null };
+    return {
+      state: 'fresh',
+      asOf: now,
+      recordIds: new Set(deps.publishDispatcher.getInFlightRecordIds()),
+    };
+  }
+  const evidence = deps.publishInFlightEvidence();
+  const asOf = evidenceAsOf(evidence.asOf);
+  if (!EVIDENCE_STATES.has(evidence.state) || evidence.state !== 'fresh' || asOf === null) {
+    return {
+      state: EVIDENCE_STATES.has(evidence.state) && evidence.state !== 'fresh'
+        ? evidence.state
+        : 'invalid',
+      asOf,
+      recordIds: null,
+    };
+  }
+  if (
+    evidence.recordIds === null
+    || [...evidence.recordIds].some((recordId) => !Number.isInteger(recordId) || recordId < 0)
+  ) {
+    return { state: 'invalid', asOf, recordIds: null };
+  }
+  return { state: 'fresh', asOf, recordIds: new Set(evidence.recordIds) };
+}
+
+function configMirrorHealthResponse(deps: PanelDeps): PanelConfigMirrorHealthResponse {
+  if (deps.configMirrorServicesHealth) {
+    const response: unknown = deps.configMirrorServicesHealth();
+    if (
+      !isRecord(response)
+      || !hasExactlyKeys(response, ['services'])
+      || !Array.isArray(response.services)
+      || response.services.some((service) =>
+        !isRecord(service)
+        || (service.sourceService !== 'api' && service.sourceService !== 'automation'))
+    ) {
+      return invalidConfigMirrorServices();
+    }
+    const services = response.services as Record<string, unknown>[];
+    return {
+      services: (['api', 'automation'] as const).map((sourceService) => {
+        const matching = services.filter((candidate) =>
+          candidate.sourceService === sourceService);
+        if (matching.length !== 1) {
+          return { sourceService, asOf: null, deliveryState: 'unknown', entries: [] };
+        }
+        const service = matching[0] as Record<string, unknown>;
+        if (
+          !hasExactlyKeys(service, ['sourceService', 'asOf', 'deliveryState', 'entries'])
+          || !EVIDENCE_STATES.has(service.deliveryState as PanelEvidenceState)
+          || !Array.isArray(service.entries)
+        ) {
+          return { sourceService, asOf: null, deliveryState: 'invalid', entries: [] };
+        }
+        const deliveryState = EVIDENCE_STATES.has(service.deliveryState as PanelEvidenceState)
+          ? service.deliveryState as PanelEvidenceState
+          : 'invalid';
+        const validFresh = deliveryState !== 'fresh'
+          || (
+            typeof service.asOf === 'number'
+            && Number.isFinite(service.asOf)
+            && service.asOf >= 0
+            && (service.entries as unknown[]).every(isConfigMirrorHealthEntry)
+          );
+        return {
+          sourceService,
+          asOf: evidenceAsOf(service.asOf as number | null),
+          deliveryState: validFresh ? deliveryState : 'invalid',
+          entries: deliveryState === 'fresh' && validFresh
+            ? service.entries as PanelConfigMirrorHealthResponse['services'][number]['entries']
+            : [],
+        };
+      }),
+    };
+  }
+  const legacy: unknown = deps.configMirrorHealth!();
+  const legacyValid = isRecord(legacy)
+    && hasExactlyKeys(legacy, ['asOf', 'enabled', 'pollMs', 'entries'])
+    && typeof legacy.asOf === 'number'
+    && Number.isFinite(legacy.asOf)
+    && legacy.asOf >= 0
+    && typeof legacy.enabled === 'boolean'
+    && typeof legacy.pollMs === 'number'
+    && Number.isFinite(legacy.pollMs)
+    && legacy.pollMs >= 0
+    && Array.isArray(legacy.entries)
+    && legacy.entries.every(isConfigMirrorHealthEntry);
+  return {
+    services: [
+      { sourceService: 'api', asOf: null, deliveryState: 'unknown', entries: [] },
+      legacyValid ? {
+        sourceService: 'automation',
+        asOf: legacy.asOf as number,
+        deliveryState: 'fresh',
+        entries: legacy.entries as PanelConfigMirrorHealthResponse['services'][number]['entries'],
+      } : {
+        sourceService: 'automation',
+        asOf: null,
+        deliveryState: 'invalid',
+        entries: [],
+      },
+    ],
+  };
 }
 
 function sendDelegatedTaskError(res: http.ServerResponse, err: unknown): void {
@@ -705,6 +912,8 @@ function createRequestHandler(
       return;
     }
     if (method === 'GET' && url === '/api/dashboard/summary') {
+      const responseAsOf = Date.now();
+      const edgePresence = readEdgePresenceEvidence(deps, responseAsOf);
       const [totals, totalsByAccount, likeRate, accounts, todayPublishes, alerts] = await Promise.all([
         deps.panelStore.todayTotals(),
         deps.panelStore.todayTotalsByAccount(),
@@ -745,8 +954,10 @@ function createRequestHandler(
           ?? { activeCount: 0, deletingCount: 0, onlineCount: 0 },
       }));
       const summary: DashboardSummary = {
-        asOf: Date.now(),
-        edgesOnline: deps.edgeServer.onlineEdgeCount(), // staleness-aware（死连接不算在线，D9）
+        asOf: responseAsOf,
+        edgesOnline: edgePresence.onlineEdgeCount,
+        edgePresenceState: edgePresence.state,
+        edgePresenceAsOf: edgePresence.asOf,
         totals: { ...totals, publish: todayPublishes },
         // V1 task 9.6：归因已在事件上流通（interaction.occurred 带 accountId），上真按账号切片。
         // decouple-quota-hit-from-risk：每账号带 day 上限 + 饱和标记（用量可见）。
@@ -1145,14 +1356,15 @@ function createRequestHandler(
       // 「已批准·待下发」的判据来自持久授权记录，不是进程内在途集合——重启后该区分必须依然成立。
       // 读失败 / 未注入 → 不带下发态字段，前端回落既有呈现（MUST NOT 白屏）。
       const approvalDispatch = await readApprovalDispatchFor(deps, [...pending, ...recent]);
+      const inFlightEvidence = readPublishInFlightEvidence(deps, Date.now());
       const lifecycle = buildPublishLifecycle({
         queue,
         pending,
         recent,
-        inFlightRecordIds: deps.publishDispatcher?.getInFlightRecordIds() ?? [],
+        inFlightEvidence,
         ...(approvalDispatch ? { approvalDispatch } : {}),
       });
-      sendJson(res, 200, { ...queue, lifecycle });
+      sendJson(res, 200, { ...queue, inFlightEvidence: lifecycle.inFlightEvidence, lifecycle });
       return;
     }
     if (method === 'GET' && url === '/api/analytics/like-rate') {
@@ -2022,11 +2234,11 @@ function createRequestHandler(
     // 每个 mirrorKey 的 lastComparedAt / 当前版本 / fresh|stale。回包带 asOf = **数据时刻**，
     // 与响应时刻分开表达。刷新器未接线 → 503 诚实不可用，绝不回一个「全都新鲜」的空投影。
     if (method === 'GET' && url === '/api/config-mirrors') {
-      if (!deps.configMirrorHealth) {
+      if (!deps.configMirrorHealth && !deps.configMirrorServicesHealth) {
         sendJson(res, 503, { error: 'config_mirror_health_unavailable' });
         return;
       }
-      sendJson(res, 200, deps.configMirrorHealth());
+      sendJson(res, 200, configMirrorHealthResponse(deps));
       return;
     }
     if (method === 'PUT' && url === '/api/quotas') {

@@ -535,6 +535,21 @@
     "note": "§4.6.8：25 文件归 api，5 个限频配置文件例外"
   },
   {
+    "path": "src/config/api-sync-read-checkpoint-store.ts",
+    "layer": "api",
+    "note": "change split-cloud-api-composition-root-4b task 2.6：api consumer 自己的 target-scoped sync-read cursor/readiness/health PG adapter，只写 api_sync_read_consumer_checkpoint；owner payload 与共享业务 version 不落表。"
+  },
+  {
+    "path": "src/config/api-sync-read-mirrors.ts",
+    "layer": "api",
+    "note": "change split-cloud-api-composition-root-4b：API consumer 的 A1/A3/A4/A5/A6 进程内 last-good 镜像与 readiness adapter。"
+  },
+  {
+    "path": "src/config/api-sync-read-source.ts",
+    "layer": "api",
+    "note": "change split-cloud-api-composition-root-4b：API owner 的 B1/B2/B4/B5 repeatable-read snapshot provider；含 owner SQL，不进 kernel。"
+  },
+  {
     "path": "src/config/approval-policy-store.ts",
     "layer": "api",
     "note": "§4.6.8：25 文件归 api，5 个限频配置文件例外"
