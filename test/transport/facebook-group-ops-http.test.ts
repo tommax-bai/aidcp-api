@@ -1,3 +1,4 @@
+// aidcp:test-owner=derived
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { FacebookGroupOpsPort } from 'aidcp-kernel/kernel/facebook-group-ops-types.js';

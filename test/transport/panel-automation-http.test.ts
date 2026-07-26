@@ -1,3 +1,4 @@
+// aidcp:test-owner=derived
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { PanelAutomationReader } from 'aidcp-kernel/kernel/panel-automation-types.js';

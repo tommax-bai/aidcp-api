@@ -1,3 +1,4 @@
+// aidcp:test-owner=derived
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { AlertResolutionPort } from 'aidcp-kernel/kernel/alert-resolution-port.js';
