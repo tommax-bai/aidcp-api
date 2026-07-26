@@ -370,6 +370,11 @@
     "note": "§4.7：客户身份与环境归属权威（7/7 api）"
   },
   {
+    "path": "src/client-auth/offboard-admission-ledger.ts",
+    "layer": "api",
+    "note": "change split-cloud-api-composition-root-4a: API-owned target-bound offboard admission ledger"
+  },
+  {
     "path": "src/client-auth/rate-limiter.ts",
     "layer": "api",
     "note": "§4.7：客户身份与环境归属权威（7/7 api）"
@@ -780,6 +785,11 @@
     "note": "§4.6.2 裁决：src/feishu/ 整体归 aidcp-api（15/15）"
   },
   {
+    "path": "src/feishu/api-owner-composition.ts",
+    "layer": "api",
+    "note": "change split-cloud-api-composition-root-4a: API-only Feishu composition"
+  },
+  {
     "path": "src/feishu/bot-chats-provider.ts",
     "layer": "api",
     "note": "§4.6.2 裁决：src/feishu/ 整体归 aidcp-api（15/15）"
@@ -838,6 +848,11 @@
     "path": "src/feishu/token.ts",
     "layer": "api",
     "note": "§4.6.2 裁决：src/feishu/ 整体归 aidcp-api（15/15）"
+  },
+  {
+    "path": "src/feishu/structured-notification-delivery.ts",
+    "layer": "api",
+    "note": "change split-cloud-api-composition-root-4a: structured Feishu delivery remains API-owned"
   },
   {
     "path": "src/feishu/types.ts",
@@ -1573,6 +1588,11 @@
     "path": "src/publish-agent/publish-scheduler.ts",
     "layer": "api",
     "note": "§4.6.3：台账与审批段 7 文件之一"
+  },
+  {
+    "path": "src/publish-agent/publish-ui-update-producer.ts",
+    "layer": "api",
+    "note": "change split-cloud-api-composition-root-4a: API owner emits typed one-way UI updates"
   },
   {
     "path": "src/publish-agent/reference-image-guidance.ts",

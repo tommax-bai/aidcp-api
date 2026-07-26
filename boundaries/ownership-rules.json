@@ -126,6 +126,7 @@
     { "path": "src/publish-agent/publish-log-store.ts", "layer": "api", "basis": "§4.6.3：台账与审批段 7 文件之一" },
     { "path": "src/publish-agent/publish-pipeline-log-store.ts", "layer": "api", "basis": "§4.6.3：台账与审批段 7 文件之一" },
     { "path": "src/publish-agent/publish-scheduler.ts", "layer": "api", "basis": "§4.6.3：台账与审批段 7 文件之一" },
+    { "path": "src/publish-agent/publish-ui-update-producer.ts", "layer": "api", "basis": "change split-cloud-api-composition-root-4a: API owner reads publish_log locally and emits only the typed one-way UI update command" },
     { "path": "src/publish-agent/client-publish-approval.ts", "layer": "api", "basis": "§4.6.3：台账与审批段 7 文件之一" },
     { "path": "src/publish-agent/draft-image-remove.ts", "layer": "api", "basis": "§4.6.3：台账与审批段 7 文件之一" },
     { "path": "src/publish-agent/schedule-policy.ts", "layer": "api", "basis": "§4.6.3：台账与审批段 7 文件之一" },
