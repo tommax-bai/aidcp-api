@@ -46,6 +46,11 @@ ALTER TABLE client_env_revocation_holds
 -- wrong worker materialize or release a shared business fact, while leaving NULL would strand it
 -- behind every target-filtered scan. Stop with the first exact row so the operator can inspect the
 -- owning account/runtime evidence and assign that row deliberately before rerunning 0081.
+--
+-- After the explicit legacy-row gate, make the durable-work dimension a database invariant. An old
+-- writer that omits the new column during the rollout fails closed instead of silently creating work
+-- that neither target can claim. The 4a writers also require a valid server-injected target, and
+-- reconcile/claim retain a loud defensive gate for pre-migration or constraint-drift states.
 DO $$
 DECLARE
   unassigned_env_key TEXT;
