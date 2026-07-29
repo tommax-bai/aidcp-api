@@ -52,6 +52,10 @@ import { shanghaiDayStartMs } from 'aidcp-kernel/time/shanghai-day.js';
 import { resolveAccountDisplayName } from '../account-display-name.js';
 import { isMirrorStale } from '../config-mirror-freshness.js';
 import { writeWithMirrorBump, type MirrorVersionBumper } from '../config/mirror-version-store.js';
+import {
+  FACEBOOK_RULE_DEFINITION_ID,
+  FACEBOOK_RULE_DEFINITION_VERSION,
+} from 'aidcp-kernel/kernel/facebook-rule-mode-types.js';
 import type { SchemaEnsurer } from 'aidcp-kernel/kernel/schema-capability-contract.js';
 import type { ClientEnvAutomationReader, OffboardProjection } from 'aidcp-kernel/kernel/client-env-automation-types.js';
 import type { OffboardCleanupGrantOperations } from 'aidcp-kernel/kernel/offboard-cleanup-grant-types.js';
@@ -96,6 +100,41 @@ export type EnvironmentSlowStartRecord =
       ok: true;
       envKey: string;
       slowStartSince: number | null;
+      binding: 'binding_unknown' | 'binding_conflict';
+    }
+  | { ok: false; reason: 'environment_not_owned' | 'binding_unavailable' };
+
+/**
+ * 账号 → 唯一绑定环境的**反查**结果（change environment-level-rule-mode-and-approval）。
+ *
+ * 环境到账号结构上一对一（环境记录只有一个账号字段），账号到环境在库层没有唯一约束，所以这个方向
+ * **必然可能失败**。三种失败逐一具名，MUST NOT 合并成一个「没有」：
+ *   binding_unknown       该账号今天不绑在任何环境上；
+ *   binding_conflict      同一账号出现在多个环境，或它所在环境归属多个客户（跨客户争用）；
+ *   binding_unavailable   绑定副本陈旧 / 环境注册表读不到——**不是「没配置」**。
+ * 调用方 MUST 按各自的收紧方向 fail-closed（规则模式=不启用；审批策略=`source_rules`）。
+ */
+export type EnvironmentKeyForAccount =
+  | { ok: true; envKey: string }
+  | { ok: false; reason: 'binding_unknown' | 'binding_conflict' | 'binding_unavailable' };
+
+/**
+ * 环境级配置写入的定位结果：ownership 已核过，平台取自**环境自己的权威字段**，绑定三态只作如实标注。
+ * 未绑定账号的环境仍 `ok: true`——环境配置不以「此刻有没有执行对象」为前置。
+ */
+export type OwnedEnvironmentRecord =
+  | {
+      ok: true;
+      envKey: string;
+      /** client_environments.platform 原值（未登记为 null）；平台判定由调用方按各自口径归一。 */
+      platform: string | null;
+      binding: 'bound';
+      accountId: string;
+    }
+  | {
+      ok: true;
+      envKey: string;
+      platform: string | null;
       binding: 'binding_unknown' | 'binding_conflict';
     }
   | { ok: false; reason: 'environment_not_owned' | 'binding_unavailable' };
@@ -374,6 +413,10 @@ export interface ClientEnvironmentView {
   environmentName: string;
   label: string | null;
   platform: string | null;
+  slowStart: {
+    enabled: boolean;
+    since: number | null;
+  };
   assignees: ClientEnvAssignee[];
   assigneeCount: number;
   cleanup: ClientCleanupReceipt | null;
@@ -402,6 +445,21 @@ export interface ClientEnvironmentView {
   };
 }
 
+export type SetAdminEnvironmentSlowStartResult =
+  | {
+      ok: true;
+      envKey: string;
+      slowStart: ClientEnvironmentView['slowStart'];
+    }
+  | {
+      ok: false;
+      reason:
+        | 'environment_not_found'
+        | 'environment_not_active'
+        | 'platform_unsupported'
+        | 'environment_unavailable';
+    };
+
 export interface ClientEnvironmentSummary {
   activeCount: number;
   deletingCount: number;
@@ -427,10 +485,45 @@ export type CreateProvisioningIntentResult =
   | { ok: true; intentId: string; proof: string; expiresAt: number }
   | { ok: false; reason: 'disabled' | 'schema_unavailable' };
 
+export type EnvironmentProxyType = 'http' | 'https' | 'socks5';
+export type EnvironmentProxyAuthorityValue =
+  | { state: 'no_proxy' }
+  | {
+      state: 'configured';
+      proxyType: EnvironmentProxyType;
+      proxyHost: string;
+      proxyPort: number;
+      proxyUser: string;
+      proxyPassword: string;
+    };
+
+export interface EnvironmentProxyAuthorityRecord {
+  envKey: string;
+  authority: EnvironmentProxyAuthorityValue;
+  revision: number;
+  source: 'provisioning' | 'edge_edit' | 'local_migration' | 'admin';
+  updatedAt: number;
+}
+
+export type ReadEnvironmentProxyAuthorityResult =
+  | { ok: true; record: EnvironmentProxyAuthorityRecord }
+  | { ok: false; reason: 'environment_not_owned' | 'uninitialized' | 'schema_unavailable' };
+
+export type WriteEnvironmentProxyAuthorityResult =
+  | { ok: true; record: EnvironmentProxyAuthorityRecord }
+  | {
+      ok: false;
+      reason: 'invalid_authority' | 'environment_not_owned' | 'proxy_authority_conflict' | 'schema_unavailable';
+      currentRevision?: number;
+    };
+
 export type CompleteProvisioningIntentResult =
   | { ok: true; environment: ClientEnvScopeRow; idempotent: boolean }
   | { ok: false; reason: 'disabled' | 'invalid_intent' | 'intent_expired' | 'intent_target_mismatch' |
-      'invalid_environment' | 'environment_already_registered' | 'env_already_assigned' };
+      'invalid_environment' | 'invalid_proxy_authority' | 'proxy_authority_mismatch' |
+      /** 慢启动与规则模式开启意图同时为真：互斥，整请求拒绝，MUST NOT 静默取其一。 */
+      'conflicting_run_mode' |
+      'environment_already_registered' | 'env_already_assigned' | 'schema_unavailable' };
 
 /**
  * 一条离场的对外视图。
@@ -512,6 +605,93 @@ const ENV_KEY_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
 const PROVISIONING_INTENT_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const PROVISIONING_PROOF_PATTERN = /^[A-Za-z0-9_-]{43}$/;
 const PROVISIONING_PLATFORMS = new Set(['xiaohongshu', 'facebook', 'wechat_channels']);
+const ENVIRONMENT_PROXY_TYPES = new Set<EnvironmentProxyType>(['http', 'https', 'socks5']);
+
+interface EnvironmentProxyAuthorityDbRow {
+  env_key: string;
+  state: 'configured' | 'no_proxy';
+  proxy_type: EnvironmentProxyType | null;
+  proxy_host: string | null;
+  proxy_port: number | null;
+  proxy_user: string | null;
+  proxy_password: string | null;
+  revision: number;
+  source: EnvironmentProxyAuthorityRecord['source'];
+  updated_at: Date;
+}
+
+export function normalizeEnvironmentProxyAuthority(value: unknown): EnvironmentProxyAuthorityValue | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const raw = value as Record<string, unknown>;
+  if (raw.state === 'no_proxy') {
+    return Object.keys(raw).length === 1 ? { state: 'no_proxy' } : null;
+  }
+  const allowed = new Set(['state', 'proxyType', 'proxyHost', 'proxyPort', 'proxyUser', 'proxyPassword']);
+  if (raw.state !== 'configured' || Object.keys(raw).some((key) => !allowed.has(key))) return null;
+  const proxyType = String(raw.proxyType ?? '').trim().toLowerCase() as EnvironmentProxyType;
+  const proxyHost = String(raw.proxyHost ?? '').trim();
+  const proxyPort = typeof raw.proxyPort === 'number' ? raw.proxyPort : Number.NaN;
+  const proxyUser = typeof raw.proxyUser === 'string' ? raw.proxyUser : '';
+  const proxyPassword = typeof raw.proxyPassword === 'string' ? raw.proxyPassword : '';
+  if (!ENVIRONMENT_PROXY_TYPES.has(proxyType) ||
+      !proxyHost || proxyHost.length > 512 || /\s/.test(proxyHost) ||
+      !Number.isInteger(proxyPort) || proxyPort < 1 || proxyPort > 65535 ||
+      proxyUser.length > 512 || proxyPassword.length > 2048 ||
+      (proxyPassword.length > 0 && proxyUser.length === 0)) {
+    return null;
+  }
+  return { state: 'configured', proxyType, proxyHost, proxyPort, proxyUser, proxyPassword };
+}
+
+function proxyAuthorityValuesEqual(
+  left: EnvironmentProxyAuthorityValue,
+  right: EnvironmentProxyAuthorityValue,
+): boolean {
+  if (left.state !== right.state) return false;
+  if (left.state === 'no_proxy' || right.state === 'no_proxy') return true;
+  return left.proxyType === right.proxyType &&
+    left.proxyHost === right.proxyHost &&
+    left.proxyPort === right.proxyPort &&
+    left.proxyUser === right.proxyUser &&
+    left.proxyPassword === right.proxyPassword;
+}
+
+function mapProxyAuthorityRow(row: EnvironmentProxyAuthorityDbRow): EnvironmentProxyAuthorityRecord {
+  const authority: EnvironmentProxyAuthorityValue = row.state === 'no_proxy'
+    ? { state: 'no_proxy' }
+    : {
+        state: 'configured',
+        proxyType: row.proxy_type as EnvironmentProxyType,
+        proxyHost: String(row.proxy_host),
+        proxyPort: Number(row.proxy_port),
+        proxyUser: String(row.proxy_user),
+        proxyPassword: String(row.proxy_password),
+      };
+  return {
+    envKey: row.env_key,
+    authority,
+    revision: Number(row.revision),
+    source: row.source,
+    updatedAt: row.updated_at.getTime(),
+  };
+}
+
+function proxyAuthoritySqlValues(authority: EnvironmentProxyAuthorityValue): [
+  EnvironmentProxyType | null,
+  string | null,
+  number | null,
+  string | null,
+  string | null,
+] {
+  if (authority.state === 'no_proxy') return [null, null, null, null, null];
+  return [
+    authority.proxyType,
+    authority.proxyHost,
+    authority.proxyPort,
+    authority.proxyUser,
+    authority.proxyPassword,
+  ];
+}
 
 function provisioningProofHash(proof: string): string {
   return crypto.createHash('sha256').update(proof, 'utf8').digest('hex');
@@ -597,6 +777,16 @@ export class ClientUserStore {
   /** RiskController 同步热路径镜像：只收录当前恰好绑定一个环境的账号。 */
   private environmentSlowStartByAccount = new Map<string, number | null>();
   private ambiguousEnvironmentAccounts = new Set<string>();
+  /**
+   * 账号 → 唯一绑定环境的同步反查镜像（change environment-level-rule-mode-and-approval）。
+   *
+   * 与上面两个字段**同一次刷新**产出，不新增热路径查询。故意与 `environmentSlowStartByAccount`
+   * 分开存：慢启动那份的歧义判据只看「同一账号出现在几个环境」，本份还要把**跨客户争用**（同一环境
+   * 归属多个客户）算作歧义。合并会顺手改掉慢启动的既有语义，那不在本变更范围内。
+   */
+  private environmentKeyByAccount = new Map<string, string>();
+  /** 反查歧义账号（多环境或跨客户争用）。命中即 fail-closed，MUST NOT 任取一个环境。 */
+  private ambiguousEnvironmentKeyAccounts = new Set<string>();
 
   private readonly schemaEnsurer: SchemaEnsurer;
 
@@ -957,15 +1147,23 @@ export class ClientUserStore {
    * 重建环境配置→当前账号的同步镜像。一个账号异常出现在多个环境时不任取一行；该账号无显式环境 anchor。
    */
   async refreshEnvironmentSlowStartMirror(): Promise<void> {
+    // owner_count：该环境被几个客户归属。account→env 反查把「>1」算作争用（跨客户争用），
+    // 与读侧 contendedAcrossCustomersSql 同源；慢启动那份镜像的判据保持原样，不受此列影响。
     const { rows } = await this.pool.query<{
       env_key: string;
       account_id: string;
       slow_start_since: Date | null;
-    }>(`SELECT env_key, account_id, slow_start_since
-          FROM client_environments
-         WHERE account_id IS NOT NULL
-         ORDER BY account_id, env_key`);
-    const grouped = new Map<string, { envKey: string; since: number | null }[]>();
+      owner_count: number | string;
+    }>(`SELECT e.env_key,
+               e.account_id,
+               e.slow_start_since,
+               (SELECT count(DISTINCT s.user_id)
+                  FROM client_env_scope s
+                 WHERE s.env_key = e.env_key AND s.source = 'admin') AS owner_count
+          FROM client_environments e
+         WHERE e.account_id IS NOT NULL
+         ORDER BY e.account_id, e.env_key`);
+    const grouped = new Map<string, { envKey: string; since: number | null; ownerCount: number }[]>();
     for (const row of rows) {
       const accountId = String(row.account_id ?? '').trim();
       if (!accountId || accountId === RETIRED_ACCOUNT_ID) continue;
@@ -973,23 +1171,39 @@ export class ClientUserStore {
       entries.push({
         envKey: row.env_key,
         since: row.slow_start_since ? row.slow_start_since.getTime() : null,
+        ownerCount: Number(row.owner_count ?? 0),
       });
       grouped.set(accountId, entries);
     }
     const next = new Map<string, number | null>();
     const ambiguous = new Set<string>();
+    const envKeys = new Map<string, string>();
+    const ambiguousEnvKeys = new Set<string>();
     for (const [accountId, entries] of grouped) {
       if (entries.length === 1) {
         next.set(accountId, entries[0].since);
+        // 唯一环境仍可能被多个客户同时归属 —— 那是跨客户争用，配置反查 MUST NOT 认它。
+        if (entries[0].ownerCount > 1) {
+          ambiguousEnvKeys.add(accountId);
+          console.warn(
+            `[client-env] 环境配置反查跨客户争用：账号 ${accountId} 所在环境 ${entries[0].envKey}`
+            + ` 同时归属 ${entries[0].ownerCount} 个客户，拒绝解析出环境`,
+          );
+        } else {
+          envKeys.set(accountId, entries[0].envKey);
+        }
         continue;
       }
       ambiguous.add(accountId);
+      ambiguousEnvKeys.add(accountId);
       console.warn(
         `[client-env] 环境级慢启动绑定歧义：账号 ${accountId} 同时出现在 ${entries.length} 个环境，拒绝任取配置`,
       );
     }
     this.environmentSlowStartByAccount = next;
     this.ambiguousEnvironmentAccounts = ambiguous;
+    this.environmentKeyByAccount = envKeys;
+    this.ambiguousEnvironmentKeyAccounts = ambiguousEnvKeys;
   }
 
   /**
@@ -1007,6 +1221,83 @@ export class ClientUserStore {
 
   hasAmbiguousEnvironmentBinding(accountId: string): boolean {
     return this.ambiguousEnvironmentAccounts.has(accountId);
+  }
+
+  /**
+   * 账号 → 唯一绑定环境的同步反查（change environment-level-rule-mode-and-approval）。零 IO：
+   * 走与慢启动锚点**同一次刷新**产出的镜像，热路径不新增按请求查询。
+   *
+   * 副本陈旧 → `binding_unavailable`，**不是** `binding_unknown`：跨进程副本下「副本里没有这个账号」
+   * ≠「库里它真的没绑环境」。把未知当「没配置」，等于让一个规则模式环境静默按普通模式跑、
+   * 或让一个全局免审环境静默退回人审又反过来——两个方向都必须由调用方按自己的收紧方向处置，
+   * 而不是在这里替它们猜。
+   */
+  resolveEnvironmentKeyForAccount(accountId: string): EnvironmentKeyForAccount {
+    const account = (accountId ?? '').trim();
+    if (!account || account === RETIRED_ACCOUNT_ID) {
+      return { ok: false, reason: 'binding_unknown' };
+    }
+    if (isMirrorStale('client_environment_slow_start')) {
+      return { ok: false, reason: 'binding_unavailable' };
+    }
+    if (this.ambiguousEnvironmentKeyAccounts.has(account)) {
+      return { ok: false, reason: 'binding_conflict' };
+    }
+    const envKey = this.environmentKeyByAccount.get(account);
+    return envKey ? { ok: true, envKey } : { ok: false, reason: 'binding_unknown' };
+  }
+
+  /**
+   * 环境级配置的**定位读**：核 ownership、取环境自己的权威平台、如实报绑定三态。
+   *
+   * 与 `getEnvironmentSlowStart` 同一 SQL 形状（同一 ownership 权威范围、同一争用判据），差别只在
+   * 取回的是 `platform` 而不是慢启动锚点。它 MUST NOT 以「有没有绑定账号」为前置：环境配置写的是
+   * 环境，未绑定环境同样可读可写，只是回包要如实标注当前没有执行对象。
+   */
+  async getOwnedEnvironment(userId: string, envKey: string): Promise<OwnedEnvironmentRecord> {
+    const key = (envKey ?? '').trim();
+    if (!userId || !key) return { ok: false, reason: 'environment_not_owned' };
+    try {
+      const { rows } = await this.pool.query<{
+        owned: boolean;
+        platform: string | null;
+        bound_account: string | null;
+        account_exists: boolean;
+        contended: boolean;
+        duplicate_count: number | string;
+      }>(
+        `SELECT
+           EXISTS(SELECT 1 FROM client_env_scope s
+                   WHERE s.user_id=$1 AND s.env_key=$2 AND s.source='admin') AS owned,
+           e.platform,
+           e.account_id AS bound_account,
+           CASE WHEN e.account_id IS NOT NULL
+                THEN EXISTS(SELECT 1 FROM accounts a WHERE a.account_id=e.account_id)
+                ELSE false END AS account_exists,
+           CASE WHEN e.account_id IS NOT NULL
+                THEN ${contendedAcrossCustomersSql('e.account_id', '$1')}
+                ELSE false END AS contended,
+           CASE WHEN e.account_id IS NOT NULL
+                THEN (SELECT count(*) FROM client_environments e3 WHERE e3.account_id=e.account_id)
+                ELSE 0 END AS duplicate_count
+         FROM (SELECT $2::text AS env_key) k
+         LEFT JOIN client_environments e ON e.env_key=k.env_key`,
+        [userId, key],
+      );
+      const row = rows[0];
+      if (!row?.owned) return { ok: false, reason: 'environment_not_owned' };
+      const platform = row.platform ?? null;
+      if (row.contended || Number(row.duplicate_count) > 1) {
+        return { ok: true, envKey: key, platform, binding: 'binding_conflict' };
+      }
+      if (!row.bound_account || !row.account_exists) {
+        return { ok: true, envKey: key, platform, binding: 'binding_unknown' };
+      }
+      return { ok: true, envKey: key, platform, binding: 'bound', accountId: row.bound_account };
+    } catch (err) {
+      if (isMissingTable(err)) return { ok: false, reason: 'binding_unavailable' };
+      throw err;
+    }
   }
 
   /**
@@ -1092,6 +1383,66 @@ export class ClientUserStore {
       return this.getEnvironmentSlowStart(userId, key);
     } catch (err) {
       if (isMissingTable(err)) return { ok: false, reason: 'binding_unavailable' };
+      throw err;
+    }
+  }
+
+  async setAdminEnvironmentSlowStart(
+    envKey: string,
+    enabled: boolean,
+    now: number,
+  ): Promise<SetAdminEnvironmentSlowStartResult> {
+    const key = (envKey ?? '').trim();
+    if (!key) return { ok: false, reason: 'environment_not_found' };
+    const value = new Date(shanghaiDayStartMs(now));
+    try {
+      const result = await writeWithMirrorBump(
+        this.pool,
+        this.mirrorVersionBumper,
+        'client_environment_slow_start',
+        (q) =>
+          q.query<{ slow_start_since: Date | null }>(
+            `UPDATE client_environments
+                SET slow_start_since=CASE
+                      WHEN $2 THEN COALESCE(slow_start_since, $3)
+                      ELSE NULL
+                    END,
+                    slow_start_initialized=true,
+                    updated_at=now()
+              WHERE env_key=$1
+                AND lifecycle_state='active'
+                AND platform='facebook'
+          RETURNING slow_start_since`,
+            [key, enabled, value],
+          ),
+      );
+      const written = result.rows[0];
+      if (!written) {
+        const { rows } = await this.pool.query<{
+          lifecycle_state: string | null;
+          platform: string | null;
+        }>(
+          `SELECT lifecycle_state, platform
+             FROM client_environments
+            WHERE env_key=$1`,
+          [key],
+        );
+        const current = rows[0];
+        if (!current) return { ok: false, reason: 'environment_not_found' };
+        if (current.lifecycle_state !== 'active') {
+          return { ok: false, reason: 'environment_not_active' };
+        }
+        return { ok: false, reason: 'platform_unsupported' };
+      }
+      await this.refreshEnvironmentSlowStartMirror();
+      const since = written.slow_start_since?.getTime() ?? null;
+      return {
+        ok: true,
+        envKey: key,
+        slowStart: { enabled: since !== null, since },
+      };
+    } catch (err) {
+      if (isMissingTable(err)) return { ok: false, reason: 'environment_unavailable' };
       throw err;
     }
   }
@@ -1204,6 +1555,122 @@ export class ClientUserStore {
     }
   }
 
+  async readEnvironmentProxyAuthority(
+    userId: string,
+    envKeyInput: string,
+  ): Promise<ReadEnvironmentProxyAuthorityResult> {
+    const envKey = String(envKeyInput || '').trim();
+    if (!userId || !ENV_KEY_PATTERN.test(envKey)) {
+      return { ok: false, reason: 'environment_not_owned' };
+    }
+    try {
+      const { rows } = await this.pool.query<EnvironmentProxyAuthorityDbRow & { owned_env_key: string }>(
+        `SELECT e.env_key AS owned_env_key,
+                a.env_key,a.state,a.proxy_type,a.proxy_host,a.proxy_port,a.proxy_user,a.proxy_password,
+                a.revision,a.source,a.updated_at
+           FROM client_env_scope s
+           JOIN client_environments e
+             ON e.env_key=s.env_key AND e.lifecycle_state='active'
+           LEFT JOIN client_environment_proxy_authorities a ON a.env_key=e.env_key
+          WHERE s.user_id=$1 AND s.env_key=$2 AND s.source='admin'`,
+        [userId, envKey],
+      );
+      const row = rows[0];
+      if (!row) return { ok: false, reason: 'environment_not_owned' };
+      if (!row.env_key) return { ok: false, reason: 'uninitialized' };
+      return { ok: true, record: mapProxyAuthorityRow(row) };
+    } catch (error) {
+      if (isMissingTable(error)) return { ok: false, reason: 'schema_unavailable' };
+      throw error;
+    }
+  }
+
+  async writeEnvironmentProxyAuthority(
+    userId: string,
+    envKeyInput: string,
+    input: {
+      expectedRevision: number | null;
+      authority: unknown;
+      source: 'edge_edit' | 'local_migration';
+    },
+  ): Promise<WriteEnvironmentProxyAuthorityResult> {
+    const envKey = String(envKeyInput || '').trim();
+    const authority = normalizeEnvironmentProxyAuthority(input.authority);
+    const expectedRevision = input.expectedRevision;
+    if (!userId || !ENV_KEY_PATTERN.test(envKey)) {
+      return { ok: false, reason: 'environment_not_owned' };
+    }
+    if (!authority ||
+        (expectedRevision !== null && (!Number.isInteger(expectedRevision) || expectedRevision < 1)) ||
+        !['edge_edit', 'local_migration'].includes(input.source)) {
+      return { ok: false, reason: 'invalid_authority' };
+    }
+
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const owned = await client.query(
+        `SELECT e.env_key
+           FROM client_env_scope s
+           JOIN client_environments e
+             ON e.env_key=s.env_key AND e.lifecycle_state='active'
+          WHERE s.user_id=$1 AND s.env_key=$2 AND s.source='admin'
+          FOR UPDATE OF e`,
+        [userId, envKey],
+      );
+      if (!owned.rows[0]) {
+        await client.query('ROLLBACK');
+        return { ok: false, reason: 'environment_not_owned' };
+      }
+      const currentResult = await client.query<EnvironmentProxyAuthorityDbRow>(
+        `SELECT env_key,state,proxy_type,proxy_host,proxy_port,proxy_user,proxy_password,
+                revision,source,updated_at
+           FROM client_environment_proxy_authorities
+          WHERE env_key=$1
+          FOR UPDATE`,
+        [envKey],
+      );
+      const current = currentResult.rows[0];
+      if ((!current && expectedRevision !== null) ||
+          (current && expectedRevision !== Number(current.revision))) {
+        await client.query('ROLLBACK');
+        return {
+          ok: false,
+          reason: 'proxy_authority_conflict',
+          ...(current ? { currentRevision: Number(current.revision) } : {}),
+        };
+      }
+      const values = proxyAuthoritySqlValues(authority);
+      const written = current
+        ? await client.query<EnvironmentProxyAuthorityDbRow>(
+            `UPDATE client_environment_proxy_authorities
+                SET state=$2,proxy_type=$3,proxy_host=$4,proxy_port=$5,proxy_user=$6,proxy_password=$7,
+                    revision=revision+1,source=$8,updated_by=$9,updated_at=now()
+              WHERE env_key=$1
+              RETURNING env_key,state,proxy_type,proxy_host,proxy_port,proxy_user,proxy_password,
+                        revision,source,updated_at`,
+            [envKey, authority.state, ...values, input.source, userId],
+          )
+        : await client.query<EnvironmentProxyAuthorityDbRow>(
+            `INSERT INTO client_environment_proxy_authorities
+               (env_key,state,proxy_type,proxy_host,proxy_port,proxy_user,proxy_password,
+                revision,source,updated_by,updated_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,1,$8,$9,now())
+             RETURNING env_key,state,proxy_type,proxy_host,proxy_port,proxy_user,proxy_password,
+                       revision,source,updated_at`,
+            [envKey, authority.state, ...values, input.source, userId],
+          );
+      await client.query('COMMIT');
+      return { ok: true, record: mapProxyAuthorityRow(written.rows[0]) };
+    } catch (error) {
+      await client.query('ROLLBACK');
+      if (isMissingTable(error)) return { ok: false, reason: 'schema_unavailable' };
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
   /**
    * Cloud 权威完成“本次程序化新建”：锁 user+intent，核 proof/TTL，再在同一事务中登记
    * 从未出现过的 envKey、写入唯一 active owner、标记 intent completed。任何拒绝均不部分落库。
@@ -1217,6 +1684,11 @@ export class ClientUserStore {
       label?: string | null;
       platform?: string | null;
       slowStartEnabled?: boolean;
+      /** Facebook 专属创建意图：环境规则模式（change environment-level-rule-mode-and-approval）。 */
+      facebookRuleModeEnabled?: boolean;
+      /** Facebook 专属创建意图：环境评论审批覆盖模式。省略 = 不写策略行（= 按来源规则）。 */
+      commentApprovalMode?: string;
+      proxyAuthority: unknown;
     },
   ): Promise<CompleteProvisioningIntentResult> {
     const intentId = String(input.intentId || '').trim();
@@ -1225,6 +1697,7 @@ export class ClientUserStore {
     const label = String(input.label || '').trim().slice(0, 256) || null;
     const platformText = String(input.platform || '').trim().toLowerCase();
     const platform = PROVISIONING_PLATFORMS.has(platformText) ? platformText : null;
+    const proxyAuthority = normalizeEnvironmentProxyAuthority(input.proxyAuthority);
     if (!userId) return { ok: false, reason: 'disabled' };
     if (!PROVISIONING_INTENT_ID_PATTERN.test(intentId) || !PROVISIONING_PROOF_PATTERN.test(proof)) {
       return { ok: false, reason: 'invalid_intent' };
@@ -1232,8 +1705,24 @@ export class ClientUserStore {
     if (!ENV_KEY_PATTERN.test(envKey) || !platform) {
       return { ok: false, reason: 'invalid_environment' };
     }
-    if (input.slowStartEnabled === true && platform !== 'facebook') {
+    if (!proxyAuthority) return { ok: false, reason: 'invalid_proxy_authority' };
+    // 三条创建意图闸，全部**先于任何写入**判定，任一不过整请求拒绝、不部分登记环境：
+    //   ① 三个 Facebook 专属字段只在 platform=facebook 时接受；
+    //   ② 审批模式只接受两个枚举值；
+    //   ③ 慢启动与规则模式不得同时为真——同时提交 MUST fail-closed，MUST NOT 静默取其一。
+    const facebookOnlyIntent = input.slowStartEnabled === true
+      || input.facebookRuleModeEnabled === true
+      || input.commentApprovalMode !== undefined;
+    if (facebookOnlyIntent && platform !== 'facebook') {
       return { ok: false, reason: 'invalid_environment' };
+    }
+    if (input.commentApprovalMode !== undefined
+        && input.commentApprovalMode !== 'source_rules'
+        && input.commentApprovalMode !== 'auto_approve_all') {
+      return { ok: false, reason: 'invalid_environment' };
+    }
+    if (input.slowStartEnabled === true && input.facebookRuleModeEnabled === true) {
+      return { ok: false, reason: 'conflicting_run_mode' };
     }
     const slowStartSince = input.slowStartEnabled === true
       ? new Date(shanghaiDayStartMs(Date.now()))
@@ -1277,6 +1766,19 @@ export class ClientUserStore {
             WHERE user_id=$1 AND env_key=$2 AND source='admin'`,
           [userId, envKey],
         );
+        const existingAuthority = await client.query<EnvironmentProxyAuthorityDbRow>(
+          `SELECT env_key,state,proxy_type,proxy_host,proxy_port,proxy_user,proxy_password,
+                  revision,source,updated_at
+             FROM client_environment_proxy_authorities
+            WHERE env_key=$1`,
+          [envKey],
+        );
+        const authorityRow = existingAuthority.rows[0];
+        if (!authorityRow ||
+            !proxyAuthorityValuesEqual(mapProxyAuthorityRow(authorityRow).authority, proxyAuthority)) {
+          await client.query('ROLLBACK');
+          return { ok: false, reason: 'proxy_authority_mismatch' };
+        }
         await client.query('COMMIT');
         const row = existing.rows[0];
         if (!row) return { ok: false, reason: 'env_already_assigned' };
@@ -1304,6 +1806,42 @@ export class ClientUserStore {
         await client.query('ROLLBACK');
         return { ok: false, reason: 'environment_already_registered' };
       }
+      const proxyValues = proxyAuthoritySqlValues(proxyAuthority);
+      await client.query(
+        `INSERT INTO client_environment_proxy_authorities
+           (env_key,state,proxy_type,proxy_host,proxy_port,proxy_user,proxy_password,
+            revision,source,updated_by,updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,1,'provisioning',$8,now())`,
+        [envKey, proxyAuthority.state, ...proxyValues, userId],
+      );
+      // 创建当刻的两项环境配置（change environment-level-rule-mode-and-approval）：与环境登记、
+      // 归属、intent 完成态**同一事务**。省略意图时一行都不写——「没有行」本身就是
+      // 「规则模式关 / 按来源规则」的权威表达，写一行 false 反而会把「未配置」伪装成「配置过」。
+      if (input.facebookRuleModeEnabled === true) {
+        await client.query(
+          `INSERT INTO facebook_rule_mode_environment_config
+             (env_key,enabled,definition_id,definition_version,updated_at,updated_by)
+           VALUES ($1,true,$2,$3,now(),$4)
+           ON CONFLICT (env_key) DO NOTHING`,
+          [
+            envKey,
+            FACEBOOK_RULE_DEFINITION_ID,
+            FACEBOOK_RULE_DEFINITION_VERSION,
+            `client-provision:${intentId}`,
+          ],
+        );
+        // 规则模式配置落库 = content_schedule 这份配置镜像变了；同事务推进版本，
+        // 否则另一进程到重启前都把这个新环境当「没开规则模式」。
+        await this.mirrorVersionBumper?.bumpInTx(client, 'content_schedule');
+      }
+      if (input.commentApprovalMode !== undefined) {
+        await client.query(
+          `INSERT INTO environment_comment_approval_policy (env_key,mode,updated_by,updated_at)
+           VALUES ($1,$2,$3,now())
+           ON CONFLICT (env_key) DO NOTHING`,
+          [envKey, input.commentApprovalMode, `client-provision:${intentId}`],
+        );
+      }
       // 新环境带 slow_start_since 落库 = 慢启动锚点这个**闸门镜像**变了：同事务推进版本，
       // 否则另一 target 的进程到重启前都把这个新号当「未开启慢启动」= 满配额跑。
       await this.mirrorVersionBumper?.bumpInTx(client, 'client_environment_slow_start');
@@ -1326,11 +1864,15 @@ export class ClientUserStore {
       this.mirrorVersionBumper?.notifyAfterCommit?.(
         'client_environment_slow_start',
       );
+      if (input.facebookRuleModeEnabled === true) {
+        this.mirrorVersionBumper?.notifyAfterCommit?.('content_schedule');
+      }
       const row = assigned.rows[0];
       return { ok: true, idempotent: false, environment: { envKey: row.env_key, label: row.label,
         platform: row.platform, source: 'admin', assignedAt: row.assigned_at.getTime() } };
     } catch (error) {
       await client.query('ROLLBACK');
+      if (isMissingTable(error)) return { ok: false, reason: 'schema_unavailable' };
       if ((error as { code?: string; constraint?: string })?.code === '23505') {
         return { ok: false, reason: 'env_already_assigned' };
       }
@@ -2037,6 +2579,7 @@ export class ClientUserStore {
         account_operator_alias: string | null;
         account_platform: string | null;
         group_label: string | null;
+        slow_start_since: Date | null;
         binding_observed_at: Date | null;
         lifecycle_state: ClientEnvironmentView['lifecycle']['state'] | null;
         deleted_at: Date | null;
@@ -2080,6 +2623,7 @@ export class ClientUserStore {
                 max(e.account_id) AS account_id,max(a.label) AS account_label,max(a.nickname) AS account_nickname,
                 max(a.operator_alias) AS account_operator_alias,max(a.platform) AS account_platform,
                 max(a.group_label) AS group_label,
+                max(e.slow_start_since) AS slow_start_since,
                 max(e.binding_observed_at) AS binding_observed_at,
                 COALESCE(max(e.lifecycle_state), 'active') AS lifecycle_state,max(e.deleted_at) AS deleted_at,
                 d.request_id,d.requested_by AS deletion_requested_by,d.requested_at AS deletion_requested_at,
@@ -2140,6 +2684,10 @@ export class ClientUserStore {
           environmentName: r.environment_name ?? r.env_key,
           label: r.label,
           platform: r.platform,
+          slowStart: {
+            enabled: r.slow_start_since !== null && r.slow_start_since !== undefined,
+            since: r.slow_start_since?.getTime() ?? null,
+          },
           assignees,
           assigneeCount: assignees.length,
           cleanup,

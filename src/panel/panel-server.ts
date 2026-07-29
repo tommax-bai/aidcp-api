@@ -45,6 +45,8 @@ import { isKnownRole } from '../config/role-catalog.js';
 import { isAllowedPlatformCredential } from '../config/platform-credentials.js';
 import {
   FacebookGroupScopeError,
+  type FacebookGroupAccountScopeFilter,
+  type FacebookGroupAccountScopeMode,
   type FacebookGroupMembershipStatus,
   type FacebookGroupTargetInput,
 } from 'aidcp-kernel/kernel/facebook-group-types.js';
@@ -394,6 +396,16 @@ function createRequestHandler(
   config: PanelConfig,
 ): (req: http.IncomingMessage, res: http.ServerResponse) => void {
   const logger = config.logger ?? console;
+  const listPanelEnvironments = async () => {
+    const environments = await deps.clientUsers!.listAllEnvironments();
+    return environments.map((environment) => ({
+      ...environment,
+      slowStart: {
+        ...environment.slowStart,
+        globallyDisabled: deps.slowStartDisabled ?? false,
+      },
+    }));
+  };
 
   // 账号存在性校验（change console-cloud-panel-hardening #28）：pause/resume/风控写端点的底层是
   // ON CONFLICT INSERT，对不存在账号会凭空造幽灵行并「假成功」（违背「绝不静默假成功」红线）。
@@ -771,17 +783,55 @@ function createRequestHandler(
         sendJson(res, 503, { error: 'client_users_unavailable' });
         return;
       }
-      sendJson(res, 200, { environments: await deps.clientUsers.listAllEnvironments() });
+      sendJson(res, 200, { environments: await listPanelEnvironments() });
       return;
     }
 
-    // 环境资产只读管理：历史 lifecycle 如实返回，但 Cloud 不提供环境删除写面。
+    // 环境资产管理：历史 lifecycle 如实返回；慢启动只写 active Facebook 环境的同一环境级事实。
     if (method === 'GET' && url === '/api/environments') {
       if (!deps.clientUsers) {
         sendJson(res, 503, { error: 'client_users_unavailable' });
         return;
       }
-      sendJson(res, 200, { environments: await deps.clientUsers.listAllEnvironments(), asOf: Date.now() });
+      sendJson(res, 200, { environments: await listPanelEnvironments(), asOf: Date.now() });
+      return;
+    }
+    const slowStartMatch = url.match(/^\/api\/environments\/([^/]+)\/slow-start$/);
+    if (method === 'PUT' && slowStartMatch) {
+      if (!deps.clientUsers) {
+        sendJson(res, 503, { error: 'client_users_unavailable' });
+        return;
+      }
+      let envKey: string;
+      let body: unknown;
+      try {
+        envKey = decodeURIComponent(slowStartMatch[1]);
+        body = await readJsonBody(req);
+      } catch {
+        sendJson(res, 400, { error: 'bad_request' });
+        return;
+      }
+      if (!isRecord(body) || !hasExactlyKeys(body, ['enabled']) || typeof body.enabled !== 'boolean') {
+        sendJson(res, 400, { error: 'bad_request' });
+        return;
+      }
+      const result = await deps.clientUsers.setAdminEnvironmentSlowStart(envKey, body.enabled, Date.now());
+      if (!result.ok) {
+        const status = result.reason === 'environment_not_found'
+          ? 404
+          : result.reason === 'environment_unavailable'
+            ? 503
+            : 409;
+        sendJson(res, status, { error: result.reason });
+        return;
+      }
+      sendJson(res, 200, {
+        envKey: result.envKey,
+        slowStart: {
+          ...result.slowStart,
+          globallyDisabled: deps.slowStartDisabled ?? false,
+        },
+      });
       return;
     }
 
@@ -1012,6 +1062,19 @@ function createRequestHandler(
         sendJson(res, 400, { error: 'bad_request', reason: 'bad_enabled' });
         return;
       }
+      const accountScopeModeRaw = query.get('accountScopeMode') ?? undefined;
+      const allowedScopeModes = new Set<FacebookGroupAccountScopeFilter>([
+        'global',
+        'restricted',
+        'unscoped',
+      ]);
+      if (
+        accountScopeModeRaw
+        && !allowedScopeModes.has(accountScopeModeRaw as FacebookGroupAccountScopeFilter)
+      ) {
+        sendJson(res, 400, { error: 'bad_request', reason: 'invalid_scope_mode' });
+        return;
+      }
       sendJson(
         res,
         200,
@@ -1023,6 +1086,9 @@ function createRequestHandler(
           ...(query.get('region') ? { region: query.get('region') } : {}),
           ...(query.get('park') ? { park: query.get('park') } : {}),
           ...(query.get('direction') ? { direction: query.get('direction') } : {}),
+          ...(accountScopeModeRaw
+            ? { accountScopeMode: accountScopeModeRaw as FacebookGroupAccountScopeFilter }
+            : {}),
           ...(query.get('accountGroupLabel') ? { accountGroupLabel: query.get('accountGroupLabel') } : {}),
         }),
       );
@@ -1034,6 +1100,49 @@ function createRequestHandler(
         return;
       }
       sendJson(res, 200, await deps.facebookGroupTargets.listFacets());
+      return;
+    }
+    if (method === 'GET' && url === '/api/facebook/groups/comment-templates') {
+      if (!deps.facebookGroupTargets) {
+        sendJson(res, 503, { error: 'unavailable' });
+        return;
+      }
+      sendJson(res, 200, {
+        items: await deps.facebookGroupTargets.listRegionCommentTemplates(),
+      });
+      return;
+    }
+    if (method === 'PUT' && url === '/api/facebook/groups/comment-templates') {
+      if (!deps.facebookGroupTargets) {
+        sendJson(res, 503, { error: 'unavailable' });
+        return;
+      }
+      let body: unknown;
+      try {
+        body = await readJsonBody(req);
+      } catch {
+        sendJson(res, 400, { error: 'bad_request' });
+        return;
+      }
+      const raw = (body ?? {}) as Record<string, unknown>;
+      if (
+        typeof raw.region !== 'string'
+        || !Array.isArray(raw.commentTemplates)
+        || raw.commentTemplates.some((template) => typeof template !== 'string')
+      ) {
+        sendJson(res, 400, { error: 'bad_request', reason: 'invalid_templates' });
+        return;
+      }
+      const result = await deps.facebookGroupTargets.setRegionCommentTemplates(
+        raw.region,
+        raw.commentTemplates as string[],
+        verified.payload.sub,
+      );
+      if (!result.ok) {
+        sendJson(res, 400, { error: 'bad_request', reason: result.reason });
+        return;
+      }
+      sendJson(res, 200, result.row);
       return;
     }
     if (method === 'POST' && url === '/api/facebook/groups/import') {
@@ -1064,6 +1173,14 @@ function createRequestHandler(
         sendJson(res, 400, { error: 'bad_request', reason: 'invalid_account_group' });
         return;
       }
+      if (
+        raw.accountScopeMode !== undefined
+        && raw.accountScopeMode !== 'global'
+        && raw.accountScopeMode !== 'restricted'
+      ) {
+        sendJson(res, 400, { error: 'bad_request', reason: 'invalid_scope_mode' });
+        return;
+      }
       try {
         sendJson(res, 200, await deps.facebookGroupTargets.importTargets(
           inputs,
@@ -1071,6 +1188,9 @@ function createRequestHandler(
           {
             ...(raw.accountGroupLabels !== undefined
               ? { accountGroupLabels: raw.accountGroupLabels as string[] }
+              : {}),
+            ...(raw.accountScopeMode !== undefined
+              ? { accountScopeMode: raw.accountScopeMode as FacebookGroupAccountScopeMode }
               : {}),
             updatedBy: verified.payload.sub,
           },
@@ -1101,14 +1221,31 @@ function createRequestHandler(
         sendJson(res, 400, { error: 'bad_request', reason: 'no_targets' });
         return;
       }
-      if (!Array.isArray(raw.accountGroupLabels) || raw.accountGroupLabels.some((label) => typeof label !== 'string')) {
+      if (
+        raw.accountScopeMode !== undefined
+        && raw.accountScopeMode !== 'global'
+        && raw.accountScopeMode !== 'restricted'
+      ) {
+        sendJson(res, 400, { error: 'bad_request', reason: 'invalid_scope_mode' });
+        return;
+      }
+      if (
+        raw.accountGroupLabels !== undefined
+        && (
+          !Array.isArray(raw.accountGroupLabels)
+          || raw.accountGroupLabels.some((label) => typeof label !== 'string')
+        )
+      ) {
         sendJson(res, 400, { error: 'bad_request', reason: 'invalid_account_group' });
         return;
       }
+      const accountGroupLabels = (raw.accountGroupLabels ?? []) as string[];
+      const accountScopeMode = (raw.accountScopeMode ?? 'restricted') as FacebookGroupAccountScopeMode;
       const result = await deps.facebookGroupTargets.replaceTargetScopes(
         raw.groupUrls as string[],
-        raw.accountGroupLabels as string[],
+        accountGroupLabels,
         verified.payload.sub,
+        accountScopeMode,
       );
       if (!result.ok) {
         sendJson(res, 400, { error: 'bad_request', reason: result.reason });
@@ -1190,6 +1327,17 @@ function createRequestHandler(
         return;
       }
       sendJson(res, 200, deps.facebookCommentConfig.get(accountId));
+      return;
+    }
+    if (method === 'GET' && url.startsWith('/api/accounts/') && url.endsWith('/facebook-rule-mode')) {
+      const accountId = decodeURIComponent(
+        url.slice('/api/accounts/'.length, -'/facebook-rule-mode'.length),
+      );
+      if (!deps.facebookRuleMode) {
+        sendJson(res, 503, { error: 'facebook_rule_mode_unavailable' });
+        return;
+      }
+      sendJson(res, 200, await deps.facebookRuleMode.get(accountId));
       return;
     }
     // Facebook 发帖素材池：必须在通配 GET /api/accounts/:id 之前注册。
@@ -1854,6 +2002,48 @@ function createRequestHandler(
         return;
       }
       sendJson(res, 200, result.row);
+      return;
+    }
+    if (method === 'PUT' && url.startsWith('/api/accounts/') && url.endsWith('/facebook-rule-mode')) {
+      const accountId = decodeURIComponent(
+        url.slice('/api/accounts/'.length, -'/facebook-rule-mode'.length),
+      );
+      if (!deps.facebookRuleMode) {
+        sendJson(res, 503, { error: 'facebook_rule_mode_unavailable' });
+        return;
+      }
+      let body: unknown;
+      try {
+        body = await readJsonBody(req);
+      } catch {
+        sendJson(res, 400, { error: 'bad_request' });
+        return;
+      }
+      const raw = (body ?? {}) as Record<string, unknown>;
+      if (raw.enabled !== undefined && typeof raw.enabled !== 'boolean') {
+        sendJson(res, 400, { error: 'bad_request', reason: 'invalid_value' });
+        return;
+      }
+      const result = await deps.facebookRuleMode.set(
+        accountId,
+        { ...(raw.enabled === undefined ? {} : { enabled: raw.enabled }) },
+        `panel:${verified.payload.sub}`,
+      );
+      // change environment-level-rule-mode-and-approval：写入口按**环境**定位（store 内先把账号
+      // 解析成它唯一绑定的环境），解析不出唯一环境即具名拒绝，MUST NOT 退回写账号键旧行。
+      if (!result.ok) {
+        if (result.reason === 'environment_not_found') {
+          sendJson(res, 404, { error: 'environment_not_found' });
+        } else if (result.reason === 'environment_conflict') {
+          sendJson(res, 409, { error: 'environment_conflict' });
+        } else if (result.reason === 'environment_unavailable') {
+          sendJson(res, 503, { error: 'facebook_rule_mode_unavailable' });
+        } else {
+          sendJson(res, 400, { error: 'bad_request', reason: result.reason });
+        }
+        return;
+      }
+      sendJson(res, 200, await deps.facebookRuleMode.get(accountId));
       return;
     }
     // 风控写（V1 task 8.4）：经 registry 取账号 controller 单写；status 经枚举信号种类、quota 经 setQuotaLevel

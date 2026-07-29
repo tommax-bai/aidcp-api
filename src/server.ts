@@ -738,6 +738,9 @@ export function createApiPanelFacebookGroupTargets(
     },
     listTargets: (options) => reads.listTargets(options),
     listFacets: () => reads.listFacets(),
+    listRegionCommentTemplates: () => reads.listRegionCommentTemplates(),
+    setRegionCommentTemplates: (region, commentTemplates, updatedBy) =>
+      reads.setRegionCommentTemplates(region, commentTemplates, updatedBy),
     setEnabled: (groupUrl, enabled) => reads.setEnabled(groupUrl, enabled),
     async replaceTargetScopes(groupUrls, accountGroupLabels, updatedBy) {
       const receipt = await commands.replaceTargetScopes({

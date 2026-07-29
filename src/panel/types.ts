@@ -33,6 +33,10 @@ import type {
   SetFacebookCommentConfigResult,
 } from '../config/facebook-comment-config-store.js';
 import type {
+  FacebookRuleModeView,
+  SetFacebookRuleModeResult,
+} from '../config/facebook-rule-mode-store.js';
+import type {
   FacebookPublishImageInput,
   FacebookPublishMediaListView,
   FacebookPublishSetPatch,
@@ -42,6 +46,9 @@ import type {
   FacebookGroupAccountProgress,
   FacebookGroupImportResult,
   FacebookGroupMembershipRow,
+  FacebookGroupAccountScopeMode,
+  FacebookRegionCommentTemplateRow,
+  SetFacebookRegionCommentTemplatesResult,
   FacebookGroupTargetFacets,
   FacebookGroupTargetInput,
   FacebookGroupTargetListOptions,
@@ -305,6 +312,14 @@ export interface PanelDeps {
       updatedBy: string,
     ): Promise<SetFacebookCommentConfigResult>;
   };
+  facebookRuleMode?: {
+    get(accountId: string): Promise<FacebookRuleModeView>;
+    set(
+      accountId: string,
+      patch: { enabled?: boolean },
+      updatedBy: string,
+    ): Promise<SetFacebookRuleModeResult>;
+  };
   /**
    * 每账号 Facebook 发帖素材池（manual upload only）。未注入则 `/api/accounts/:id/facebook-publish-media`
    * 返回 503；上传经对象存储，写前必须校验账号存在且 platform=facebook。
@@ -327,15 +342,26 @@ export interface PanelDeps {
     importTargets(
       inputs: FacebookGroupTargetInput[],
       importBatch: string | null,
-      options?: { accountGroupLabels?: string[]; updatedBy?: string },
+      options?: {
+        accountScopeMode?: FacebookGroupAccountScopeMode;
+        accountGroupLabels?: string[];
+        updatedBy?: string;
+      },
     ): Promise<FacebookGroupImportResult>;
     listTargets(options?: FacebookGroupTargetListOptions): Promise<FacebookGroupTargetListResult>;
     listFacets(): Promise<FacebookGroupTargetFacets>;
+    listRegionCommentTemplates(): Promise<FacebookRegionCommentTemplateRow[]>;
+    setRegionCommentTemplates(
+      region: string,
+      commentTemplates: string[],
+      updatedBy: string,
+    ): Promise<SetFacebookRegionCommentTemplatesResult>;
     setEnabled(groupUrl: string, enabled: boolean): Promise<FacebookGroupTargetRow | null>;
     replaceTargetScopes(
       groupUrls: string[],
       accountGroupLabels: string[],
       updatedBy: string,
+      accountScopeMode?: FacebookGroupAccountScopeMode,
     ): Promise<ReplaceFacebookGroupTargetScopesResult>;
     accountProgress(): Promise<FacebookGroupAccountProgress[]>;
     listAssignments(limit?: number): Promise<FacebookGroupMembershipRow[]>;
@@ -496,6 +522,8 @@ export interface PanelDeps {
    * 同一 store 实例亦供客户鉴权服务做 auth/scope 读（单实例共享 PG 池）。
   */
   clientUsers?: ClientUserStore;
+  /** Cloud 全局慢启动停用闸的启动真态；仅用于 Panel 诚实投影，不替代环境配置。 */
+  slowStartDisabled?: boolean;
   onClientOffboardCreated?: (offboard: import('../client-auth/client-user-store.js').ClientOffboardView) => Promise<void>;
 }
 
