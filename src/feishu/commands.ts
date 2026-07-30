@@ -19,12 +19,38 @@ import type { CommandResult, CommandResultLevel, PublishApprovalPayload } from '
 import { buildPublishApprovalCard } from './cards.js';
 import { FeishuMessenger } from './messenger.js';
 import type { BotChatRecord } from '../cache/bot-chat-store.js';
+import { isDelegatedTaskServiceError } from 'aidcp-kernel/kernel/operator-command-port.js';
 
 /** 已识别的指令动作 */
 export type CommandAction = 'status' | 'pause' | 'resume' | 'publish-test' | 'publish' | 'comment' | 'bind' | 'help';
 
 /** 单条飞书消息允许携带的最大原子命令数，防止一次消息无界放大后台工作。 */
 export const MAX_COMMANDS_PER_MESSAGE = 8;
+
+/**
+ * 分号批命令给每条子命令编稳定来源 id 用的分隔符。**MUST NOT 是冒号。**
+ *
+ * 冒号正是运营指令幂等键的分段分隔符（kernel `OPERATOR_COMMAND_ID_SEPARATOR`），而那边的合法性
+ * 检查明确拒绝含分隔符或空白的分段。⇒ 子命令 id 里带冒号，拿它当幂等键会算出 `null`，
+ * 而契约要求「拿到 `null` MUST 当场判成参数错误并拒绝下发」⇒ **每一条分号批里的委托 / 发帖 /
+ * 评论都会被拒发，而且拒得「有道理」，是最难查的那一类**。
+ */
+const BATCH_SUB_COMMAND_SEPARATOR = '-';
+
+/**
+ * 分号批里第 `index`（0 基）条子命令的稳定来源 id。
+ *
+ * **单射**：飞书消息 id 形如 `om_<hex>`、本身不含 `-`，故 `<messageId>-command-<n>` 反解唯一。
+ * 这里**刻意不做** `replace` 归一——顺手 replace 会把两个不同的 messageId 归成同一个，
+ * 那是把「一条命令被拒发」换成「两条命令共用一把幂等键」，后者更隐蔽也更贵。
+ *
+ * 合法性由 `test/feishu/batch-command-idempotency-key.test.ts` 机械钉住（拿真 kernel 函数算一遍，
+ * 而不是在这里重述一遍它的规则）：kernel 哪天把分隔符改成 `-`，那条用例当场红。
+ */
+export function batchSubCommandMessageId(messageId: string, index: number): string {
+  const sep = BATCH_SUB_COMMAND_SEPARATOR;
+  return `${messageId}${sep}command${sep}${index + 1}`;
+}
 
 const COMMAND_AFTER_SEPARATOR =
   /[;；](?=\s*\/(?:aidcp\s+\/?(?:status|pause|resume|publish-test|publish|comment|bind|help)|(?:status|pause|resume|publish-test|publish|comment|bind|task|help))\b)/giu;
@@ -363,7 +389,7 @@ export class CommandRouter {
 
     return Promise.all(commands.map(async (command, index) => {
       const childContext = context?.messageId
-        ? { ...context, messageId: `${context.messageId}:command:${index + 1}` }
+        ? { ...context, messageId: batchSubCommandMessageId(context.messageId, index) }
         : context;
       try {
         return await this.handle(command, childContext);
@@ -424,16 +450,40 @@ export class CommandRouter {
     }
   }
 
+  /**
+   * 受理自由文本 / 旧写命令。
+   *
+   * **异常必须分流，不能一律画成「你的话没说清楚」。** 此前这里把**所有**抛出物统一渲染成黄色的
+   * 「委托任务需要补充信息」，于是三件性质完全不同的事在运营眼里长得一模一样：
+   *   ① 解析器真的看不懂这句话（**这条才是「需要补充信息」**）；
+   *   ② 这台机器上压根没接委托处理器（拆进程后 api 侧的常态）——它是**未送达**，不是没说清楚；
+   *   ③ 够不着处理器 / 超时——它是**结果未知**，而委托可能已经落了、甚至已经在跑了。
+   *
+   * ②③ 被画成①的代价是运营会去改措辞重发，而重发对②无效、对③则可能真的发第二次。
+   * 判据用结构化守卫（**不用 `instanceof`**：跨进程后错误是 JSON 反序列化出来的裸对象）：
+   * 认得出业务原因码的才是①，其余一律如实说「未受理 / 结果未知」并把原文带出来。
+   */
   private async runDelegated(text: string, context?: { chatId?: string; messageId?: string }): Promise<CommandResult> {
     try {
       return await this.actions.delegate!(text, context);
     } catch (err) {
+      const detail = (err as Error)?.message ?? String(err);
+      if (isDelegatedTaskServiceError(err)) {
+        return {
+          command: text,
+          ok: false,
+          level: 'warning',
+          title: '委托任务需要补充信息',
+          message: detail,
+        };
+      }
       return {
         command: text,
         ok: false,
-        level: 'warning',
-        title: '委托任务需要补充信息',
-        message: (err as Error).message ?? String(err),
+        level: 'error',
+        title: '委托未受理，结果未知',
+        message:
+          `这条委托没能送到处理器，**本次是否已生效未知**——请先查任务列表再决定是否重发。\n\n原因：${detail}`,
       };
     }
   }
