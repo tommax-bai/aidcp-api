@@ -1194,7 +1194,12 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
     dispatch: async () => {
       throw new Error('automation_operator_command_unavailable:dispatch');
     },
-    dispatchActive: () => false,
+    // **刻意不传**（cloud task 1.3a；交接文档 §4.1 早就点名了这一处）。
+    // 这里原本写的是 `() => false`——把「读不到调度引擎」答成「调度引擎正常停着」。
+    // 面板上 false 的含义是后者，运营看到它什么都不会做，而真相是这个进程根本没接那条通道。
+    // 字段是可选的（1.4a 把它改可选，正是为了让「诚实地缺席」在类型层表达得出来），
+    // 省略即回 null + 具名 `not_wired`。**MUST NOT 为了把结构填满再补一个假值。**
+    // 要在这里读到真状态，得照 cloud 组装根那样建一个指向 automation 的客户端。
     managementChatIds,
     logger: console,
   });
