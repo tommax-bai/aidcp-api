@@ -8,7 +8,7 @@ import type {
   ManagedTaskCommandPort,
   ManagedTaskEnvelope,
   QueryManagedTaskResult,
-} from 'aidcp-managed-task-transport/transport/managed-task-http.js';
+} from 'aidcp-transport/transport/managed-task-http.js';
 import {
   ClientUserManagedTaskAuthorization,
   ManagedTaskApiOwnerAdapter,

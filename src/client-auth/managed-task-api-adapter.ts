@@ -21,7 +21,7 @@ import {
   type ManagedTaskRejection,
   type QueryManagedTaskInput,
   type QueryManagedTaskResult,
-} from 'aidcp-managed-task-transport/transport/managed-task-http.js';
+} from 'aidcp-transport/transport/managed-task-http.js';
 import type { PlatformId } from 'aidcp-kernel/kernel/platform-types.js';
 import type { AccountStore } from '../account-store.js';
 import type { ClientUserStore } from './client-user-store.js';
