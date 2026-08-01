@@ -126,6 +126,7 @@ import { createApiSyncReadConsumerCheckpointStore } from './config/api-sync-read
 import { ApiSyncReadMirrors } from './config/api-sync-read-mirrors.js';
 import { ApiSyncReadSnapshotSource } from './config/api-sync-read-source.js';
 import { FacebookCommentConfigStore } from './config/facebook-comment-config-store.js';
+import { FacebookOperationPolicyStore } from './config/facebook-operation-policy-store.js';
 import { createPersonaPanel } from './config/persona-facade.js';
 import { PersonaStore } from './config/persona-store.js';
 import { CategoryConfigStore } from './config/category-config-store.js';
@@ -1040,6 +1041,23 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
     pool,
     schemaEnsurer: migrationManagedSchema,
   });
+  /**
+   * Facebook 运营基线（change split-cloud-automation-production-runtime 批 E-2 步骤 2）。
+   *
+   * 构造它**不是为了本进程自己用**，而是为了发得出同步读流 `facebook_operation_policy` ——
+   * 自动化进程的 Facebook 浏览模式整个挂在这条流上，发不出来那边就是「账号永远不开始浏览」。
+   * 与上面模型配置三件套同形（构造只为答别的进程），判据见批 A 的清单：**看结果有没有去处，
+   * 不是看去处在不在本进程**。
+   *
+   * **不传 mirrorVersionBumper**：本进程今天只读这几张表、写口还在单体里；
+   * 将来把策略写口搬进本 main 时 MUST 同时补 bumper，否则跨进程失效通道会静默断掉
+   * ——自动化侧的基线副本再也不会刷新，而两边都不报错。
+   */
+  const facebookOperationPolicy = new FacebookOperationPolicyStore({
+    pool,
+    schemaProber: probeSchemaShape,
+    executionTarget: target,
+  });
   const replyScopes = new ReplyConfigScopeStore({ pool });
   const publishApprovalStore = new PublishApprovalStore({
     pool,
@@ -1065,6 +1083,7 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
     firstPostProgress.init(),
     contentSchedule.init(),
     facebookCommentConfig.init(),
+    facebookOperationPolicy.init(),
     personaStore.init(),
     replyScopes.init(),
     modelConfigStore.init(),
@@ -1318,14 +1337,12 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
     pool,
     parseSoul: (personaText) =>
       JSON.parse(JSON.stringify(loadSoulFromYaml(personaText))) as SyncReadJson,
-    // 本进程**还没有构造** Facebook 运营策略存储（批 E-2 步骤 2 之后的接线欠账，登记在
-    // tasks 3.1e）。缺实现时**响亮失败，MUST NOT 回落成空表**：
-    // 空表在自动化进程那边读起来是「这台机器上没有任何 Facebook 环境」，
-    // 于是每个 FB 账号都被一个**错误原因**永久拦住浏览，而两边都不报错。
+    // 发布前**先按库回读**：本进程的内存镜像可能落后于已经推进的版本游标，
+    // 那会发出「新游标 + 旧基线」，消费方存下就再也不会重取（游标没变就不拉）。
+    // 合成规则只在属主存储里有一份，这里 MUST NOT 用 SQL 另算一遍。
     facebookOperationBaselines: async () => {
-      throw new Error(
-        'facebook_operation_policy_store_not_constructed_in_api_entry',
-      );
+      await facebookOperationPolicy.refreshFromAuthority();
+      return facebookOperationPolicy.baselineProjections();
     },
   });
   const syncReadMirrors = new ApiSyncReadMirrors(target);
