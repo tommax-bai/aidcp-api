@@ -52,6 +52,15 @@ import type {
 } from 'aidcp-kernel/kernel/publish-approval-contract.js';
 import { resolveOwnerPgConfig } from 'aidcp-kernel/kernel/pg-owner-connection-resolver.js';
 import { SCHEDULED_AUTOMATION_CATALOG_READER } from 'aidcp-kernel/kernel/scheduled-automation-catalog.js';
+import type { ProviderSecretReader } from 'aidcp-kernel/kernel/provider-secret-port.js';
+import type {
+  RoleModelSelectionReader,
+  RoleModelSelectionSource,
+} from 'aidcp-kernel/kernel/role-model-selection-port.js';
+import {
+  normProvider,
+  type TextProviderId,
+} from 'aidcp-kernel/kernel/text-provider-registry.js';
 import {
   EdgeResumeCommandHttpClient,
   FacebookScopeCommandHttpClient,
@@ -97,6 +106,8 @@ import {
 import {
   PublishDispatchTriggerHttpClient,
 } from 'aidcp-transport/transport/publish-dispatch-trigger-http.js';
+import { registerProviderSecretRoutes } from 'aidcp-transport/transport/provider-secret-http.js';
+import { registerRoleModelSelectionRoutes } from 'aidcp-transport/transport/role-model-selection-http.js';
 import { PgAccountStore } from './account-store.js';
 import { AccountStateManager } from './account-state.js';
 import { NotificationContactStore } from './cache/notification-contact-store.js';
@@ -117,6 +128,11 @@ import { ApiSyncReadSnapshotSource } from './config/api-sync-read-source.js';
 import { FacebookCommentConfigStore } from './config/facebook-comment-config-store.js';
 import { createPersonaPanel } from './config/persona-facade.js';
 import { PersonaStore } from './config/persona-store.js';
+import { CategoryConfigStore } from './config/category-config-store.js';
+import { CredentialStore } from './config/credential-store.js';
+import { ModelConfigStore } from './config/model-config-store.js';
+import { RoleConfigStore } from './config/role-config-store.js';
+import { ROLE_CATALOG, categoryOf, type ThinkingMode } from './config/role-catalog.js';
 import type {
   ApiFeishuOwner,
   StartApiFeishuIngressInput,
@@ -546,6 +562,15 @@ interface ApiCompositionRoot {
     ownerSource: ApiSyncReadSnapshotSource;
     consumer: ApiSyncReadConsumerRuntime;
     panelEvidence: ReturnType<typeof createApiSyncReadPanelEvidencePorts>;
+  };
+  /**
+   * content 进程经内部 HTTP 取的两条窄读口，事实源（三张模型配置表 + 凭据表）都在本域。
+   * **两条都 MUST 无条件注册**：对端拿不到时的表现不是报错，而是被调用点吞成「本来就没配」
+   * 然后静默回落 env —— 一条链路悄悄不工作、零信号。
+   */
+  contentReads: {
+    roleModelSelectionSource: RoleModelSelectionSource;
+    providerSecretReader: ProviderSecretReader;
   };
   business: {
     startIngress(): Promise<void>;
@@ -1020,6 +1045,16 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
     pool,
     executionTarget: target,
   });
+  // 模型配置三张表 + 加密凭据表（change split-cloud-automation-production-runtime，A-3）。
+  // 全是本域属主表；构造它们**不是**为了本进程自己用，而是为了把两条窄口喂给 content 进程
+  // ——单体在 startContentReadApi 里注册这两条 route，本手写 main 一直漏注册，
+  // 结果 content 侧的库内密钥读必失败、且被调用点吞成「本来就没配」（见 contentReads 那一段）。
+  // **不传 mirrorVersionBumper**：本进程只读这三张表、不经它们写；缺省语义即「不推版本」。
+  // 将来若把面板配置写口也搬进本 main，MUST 同时补上 bumper，否则跨进程失效通道会静默断掉。
+  const modelConfigStore = new ModelConfigStore({ pool, schemaEnsurer: migrationManagedSchema });
+  const roleConfigStore = new RoleConfigStore({ pool, schemaEnsurer: migrationManagedSchema });
+  const categoryConfigStore = new CategoryConfigStore({ pool, schemaEnsurer: migrationManagedSchema });
+  const credentialStore = new CredentialStore({ pool, schemaEnsurer: migrationManagedSchema });
 
   await Promise.all([
     accountStore.init(),
@@ -1032,6 +1067,10 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
     facebookCommentConfig.init(),
     personaStore.init(),
     replyScopes.init(),
+    modelConfigStore.init(),
+    roleConfigStore.init(),
+    categoryConfigStore.init(),
+    credentialStore.init(),
     migrationManagedSchema(pool, {
       capability: 'publish_approval',
       sinceVersion: '0063_publish_approval_decision',
@@ -1040,6 +1079,67 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
   ]);
   const accountState = new AccountStateManager(accountStore);
   await accountState.init();
+
+  // ── content 进程要用、事实源在本域的两条窄口 ──────────────────────────────────────────
+  // 解析逻辑**只此一份**：四层回落（per-role → 分类 → 全局 → 代码默认）在属主侧算完再送快照，
+  // 绝不把三张表送过去让调用方复刻——复刻正是「两侧各写一份、各自编译通过、只有真跑才发现不一致」。
+  // 与单体 segA 里那份逐字同源。
+  const resolveSelection = (role?: string): { provider: TextProviderId; model: string } => {
+    if (role) {
+      const ro = roleConfigStore.getForRole(role);
+      if (ro.model?.trim()) return { provider: normProvider(ro.provider), model: ro.model.trim() };
+      const catId = categoryOf(role);
+      if (catId) {
+        const cat = categoryConfigStore.getForCategory(catId);
+        if (cat.model?.trim()) return { provider: normProvider(cat.provider), model: cat.model.trim() };
+      }
+    }
+    const g = modelConfigStore.getCached();
+    return { provider: normProvider(g.textProvider), model: g.textModel };
+  };
+  // 温度只两层（无分类层）；思考模式两层、无全局层。与单体同。
+  const resolveTempForRole = (role?: string): number | undefined =>
+    (role ? roleConfigStore.getForRole(role).temperature : null) ?? undefined;
+  const resolveThinkingForRole = (role?: string): ThinkingMode | undefined => {
+    if (!role) return undefined;
+    const ro = roleConfigStore.getForRole(role).thinkingMode;
+    if (ro) return ro;
+    const catId = categoryOf(role);
+    if (catId) {
+      const cat = categoryConfigStore.getForCategory(catId).thinkingMode;
+      if (cat) return cat;
+    }
+    return undefined;
+  };
+  const roleModelSelection: RoleModelSelectionReader = {
+    forRole: (role) => {
+      const sel = resolveSelection(role);
+      const temperature = resolveTempForRole(role);
+      const thinkingMode = resolveThinkingForRole(role);
+      return {
+        provider: sel.provider,
+        model: sel.model,
+        ...(temperature === undefined ? {} : { temperature }),
+        ...(thinkingMode === undefined ? {} : { thinkingMode }),
+      };
+    },
+  };
+  const contentReads = {
+    // 取源：把**全部已登记角色**逐个预解析成快照。未登记角色查不到 ⇒ 调用方用 fallback（即全局那一层），
+    // 与单体逐字一致（那种角色本来就穿过前两层落到全局）。
+    roleModelSelectionSource: {
+      fetchRoleModelSelections: async () => ({
+        fallback: roleModelSelection.forRole(),
+        byRole: Object.fromEntries(
+          ROLE_CATALOG.map((r) => [r.roleId, roleModelSelection.forRole(r.roleId)]),
+        ),
+      }),
+    } satisfies RoleModelSelectionSource,
+    // 厂商密钥：只在对端启动期被调几次、不在热路径 ⇒ 普通异步跨进程读即可，不需要镜像。
+    providerSecretReader: {
+      getSecretForRuntime: (provider, field) => credentialStore.getSecretForRuntime(provider, field),
+    } satisfies ProviderSecretReader,
+  };
 
   const pairedCommands = {
     edgeResume: new EdgeResumeCommandHttpClient(automationHttp, automationToken, target),
@@ -1281,6 +1381,7 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
       consumer: syncReadConsumer,
       panelEvidence: createApiSyncReadPanelEvidencePorts(syncReadMirrors),
     },
+    contentReads,
     business: {
       startIngress: startBusinessIngress,
     },
@@ -1309,6 +1410,11 @@ function registerApiAuthorityRoutes(
   registerAutomationConfigCommandsRoutes(server, port.automationConfigCommands, token, target);
   registerOffboardAdmissionLedgerRoutes(server, port.offboardAdmissionLedger, token, target);
   registerStructuredNotificationRoutes(server, port.notificationDelivery, token, target);
+  // content 侧的两条窄读（change split-cloud-automation-production-runtime，A-3）：
+  // 单体在 startContentReadApi 里注册这两条，本 main 此前漏了 ⇒ content 读库内密钥必失败。
+  // **无条件注册**、绝不加 `if`：这两条的事实源是本域属主表，缺席不是「本进程没配」而是接线漏了。
+  registerRoleModelSelectionRoutes(server, root.contentReads.roleModelSelectionSource);
+  registerProviderSecretRoutes(server, root.contentReads.providerSecretReader);
   const publishApprovalToken = requiredEnv('AIDCP_PUBLISH_APPROVAL_INTERNAL_TOKEN');
   registerPublishApprovalAuthorityRoutes(
     server,
