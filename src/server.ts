@@ -1318,6 +1318,15 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
     pool,
     parseSoul: (personaText) =>
       JSON.parse(JSON.stringify(loadSoulFromYaml(personaText))) as SyncReadJson,
+    // 本进程**还没有构造** Facebook 运营策略存储（批 E-2 步骤 2 之后的接线欠账，登记在
+    // tasks 3.1e）。缺实现时**响亮失败，MUST NOT 回落成空表**：
+    // 空表在自动化进程那边读起来是「这台机器上没有任何 Facebook 环境」，
+    // 于是每个 FB 账号都被一个**错误原因**永久拦住浏览，而两边都不报错。
+    facebookOperationBaselines: async () => {
+      throw new Error(
+        'facebook_operation_policy_store_not_constructed_in_api_entry',
+      );
+    },
   });
   const syncReadMirrors = new ApiSyncReadMirrors(target);
   const syncReadConsumer = new ApiSyncReadConsumerRuntime(
