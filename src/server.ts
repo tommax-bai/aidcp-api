@@ -1371,6 +1371,12 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
       getPlatformOrNull: (accountId) => accountStore.getPlatformOrNull(accountId),
       getContactInfo: (accountId) => accountStore.getContactInfo(accountId),
       recordNickname: (accountId, nickname) => accountStore.recordNickname(accountId, nickname),
+      // 批 H：自动化侧的自我保护出口。**走状态管理器而不是直写存储** ——
+      // 它同时维护进程内投影，绕过去会让本进程随后的判定还以为这个账号是活的。
+      pauseAccount: async (accountId, reason) => {
+        await accountState.pause(accountId);
+        console.warn(`[account-state] 账号已暂停 account=${accountId} reason=${reason}`);
+      },
     },
     publishLog,
     edgePublish,
@@ -1431,6 +1437,10 @@ function registerApiAuthorityRoutes(
   registerAccountPersonaRoutes(server, port.accountPersona, token, target);
   registerEnvironmentHandshakeRoutes(server, port.environmentHandshake, token, target);
   registerCommentApprovalPolicyRoutes(server, port.commentApprovalPolicy, token, target);
+  // 批 H：**排期名额回程刻意未注册** —— 本进程还没有内容排期调度器，
+  // 而那条口的属主判据是「这一格是不是我点的火」，账本就在调度器进程内。
+  // 注册一条背后没有调度器的路由，就是新造一处「看着接好了、其实永不触发」。
+  // 等本进程真的构造排期器时，连同它一起注册（automation 侧客户端已就位、缺席后果已写明）。
   registerNotificationContactsRoutes(server, port.notificationContacts, token, target);
   registerFirstPostProgressRoutes(server, port.firstPostProgress, token, target);
   registerAutomationConfigCommandsRoutes(server, port.automationConfigCommands, token, target);
