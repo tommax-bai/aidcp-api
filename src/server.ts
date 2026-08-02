@@ -105,7 +105,17 @@ import {
 } from 'aidcp-transport/transport/publish-approval-decision-http.js';
 import {
   AutomationDispatchCommandHttpClient,
+  DelegatedTaskTextCommandHttpClient,
 } from 'aidcp-transport/transport/operator-command-http.js';
+import {
+  DelegatedTaskHttpClient,
+} from 'aidcp-transport/transport/delegated-task-http.js';
+import {
+  delegatedTaskRejectionToError,
+  operatorCommandId,
+  type DelegatedTaskCommandPort,
+} from 'aidcp-kernel/kernel/operator-command-port.js';
+import { DelegatedTaskServiceError } from 'aidcp-kernel/kernel/delegated-task-types.js';
 import {
   PublishDispatchTriggerHttpClient,
 } from 'aidcp-transport/transport/publish-dispatch-trigger-http.js';
@@ -1182,6 +1192,36 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
     target,
   );
 
+  /**
+   * 委托任务指令面的远端形态：**两个客户端合成一个 7+1 端口**。
+   *
+   * 不把它们合进同一个传输文件：一个是端口面（既有 7 方法）、一个是指令面（自由文本入口），
+   * 合并会让路由表失去 `satisfies Record<keyof Port, string>` 那道
+   * 「端口加了方法而路由没跟上就编译红」的保护。
+   *
+   * **逐方法显式转调，MUST NOT 用对象展开**：展开拿不到类实例原型上的方法，
+   * 那种错编译得过、要真跑起来才现形。
+   *
+   * 服务端那一半在 `aidcp-automation` 的 `main()` 里注册（`registerDelegatedTaskRoutes`
+   * + `registerDelegatedTaskTextCommandRoutes`）——**接之前去对面 `main()` 里确认过**，
+   * 不是「客户端建得出来就算接通」：客户端只吃基址与令牌，路由不在对面照样编译得过、
+   * 两仓测试各自全绿，只有真跑两个进程才 404，而那个 404 会被读成「对面版本落后」。
+   */
+  const delegatedTasks: DelegatedTaskCommandPort = ((): DelegatedTaskCommandPort => {
+    const seven = new DelegatedTaskHttpClient(automationHttp, automationToken, target);
+    const text = new DelegatedTaskTextCommandHttpClient(automationHttp, automationToken, target);
+    return {
+      createDraft: (intent) => seven.createDraft(intent),
+      confirm: (taskId, version) => seven.confirm(taskId, version),
+      pause: (taskId, version) => seven.pause(taskId, version),
+      resume: (taskId, version) => seven.resume(taskId, version),
+      cancel: (taskId, version) => seven.cancel(taskId, version),
+      get: (taskId) => seven.get(taskId),
+      list: (filter) => seven.list(filter),
+      createFromText: (input) => text.createFromText(input),
+    };
+  })();
+
   const personaPanel = createPersonaPanel({ store: personaStore });
   const accountPersona = new AccountPersonaService({
     generator: personaGeneratorFromCommand(pairedCommands.personaGenerator),
@@ -1316,8 +1356,105 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
       },
     },
     bindChat: (record) => apiFeishu.botChatStore.setDefault(record),
-    delegate: async () => {
-      throw new Error('automation_operator_command_unavailable:delegate');
+    // 自由文本委托（`/delegate`）。语义逐条照单体的 api 模式，**不重组新形状**：
+    // 四种非成功回执各有各的真相，压成一句「失败」会让运营分不出该重试还是该改参数。
+    delegate: async (text, context) => {
+      // 幂等键：`requestKey` 取飞书消息 id（跨重投稳定），`scope` 取来源会话。
+      // **拿不到消息 id 就拒发，绝不用随机数或当前时刻兜底** —— 那样键跨重试就变了，
+      // 等于宣布这套幂等不存在（反面样板就在本文件上面那条 edge resume 上）。
+      const requestKey = context?.messageId;
+      const commandId = requestKey
+        ? operatorCommandId({
+            kind: 'delegated_task_text',
+            scope: context?.chatId ?? 'feishu',
+            requestKey,
+          })
+        : null;
+      if (!commandId) {
+        throw new DelegatedTaskServiceError(
+          'command_key_unavailable',
+          '这条消息没有可用于判重的稳定标识，未受理（重发同一条消息不会重复执行，但本次没有执行）。',
+          400,
+        );
+      }
+      const receipt = await delegatedTasks.createFromText({
+        commandId,
+        text,
+        ...(context?.messageId ?? context?.chatId
+          ? { sourceRef: (context?.messageId ?? context?.chatId)! }
+          : {}),
+        ...(context?.chatId ? { originChatId: context.chatId } : {}),
+      });
+      if (receipt.outcome === 'not_delivered') {
+        // **MUST NOT 表述成已受理 / 已排队。**「没接线」是对面明确答出来的结论，
+        // 与「结果未知」（对面没答上来，走抛）是两回事。
+        return {
+          command: text,
+          ok: false,
+          level: 'error' as const,
+          title: '委托未送达',
+          message: `这台机器上没有接这条指令的处理器（${receipt.reason}），本次**没有**执行。`,
+        };
+      }
+      if (receipt.outcome === 'collision') {
+        return {
+          command: text,
+          ok: false,
+          level: 'error' as const,
+          title: '委托键冲突',
+          message: '同一把幂等键已被用于另一个作用域，未受理；请重新发起。',
+        };
+      }
+      if (receipt.outcome === 'rejected') {
+        // 还原成业务错误再抛：调用方（CommandRouter）对它的渲染与单体逐位一致
+        //（黄色「委托任务需要补充信息」）。
+        throw delegatedTaskRejectionToError(receipt.rejection);
+      }
+      const result = receipt.result;
+      if (result.kind === 'control') {
+        const task =
+          result.action === 'pause'
+            ? await delegatedTasks.pause(result.taskId)
+            : result.action === 'resume'
+              ? await delegatedTasks.resume(result.taskId)
+              : result.action === 'cancel'
+                ? await delegatedTasks.cancel(result.taskId)
+                : await delegatedTasks.get(result.taskId);
+        return {
+          command: text,
+          ok: true,
+          title: '委托任务当前状态',
+          message:
+            `任务 ${task.id} 当前为 ${task.status}，真实完成 `
+            + `${task.progress.successCount}/${task.targetSuccessCount}。`,
+          accountId: task.accountId,
+          accountName: task.accountName,
+          platformName: task.platform,
+          card: apiFeishu.buildDelegatedTaskProgressCard(task),
+        };
+      }
+      if (result.autoQueued) {
+        return {
+          command: text,
+          ok: true,
+          title: '委托任务已直接排队',
+          message: '精确命令已直接入队；结果由任务自身的结果卡回报。',
+          accountId: result.task.accountId,
+          accountName: result.task.accountName,
+          platformName: result.task.platform,
+          silent: true,
+        };
+      }
+      return {
+        command: text,
+        ok: true,
+        title: result.created ? '委托任务待确认' : '已存在相同待确认任务',
+        message: '确认前不会执行任何平台写动作。',
+        accountId: result.task.accountId,
+        accountName: result.task.accountName,
+        platformName: result.task.platform,
+        card: apiFeishu.buildDelegatedTaskConfirmationCard(result.confirmation),
+      };
     },
     publish: async () => {
       throw new Error('automation_operator_command_unavailable:publish');
@@ -1359,6 +1496,10 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
     if (businessIngressStarted) return;
     await apiFeishu.startIngress({
       commandFace,
+      // 委托卡片上那几个按钮（确认 / 暂停 / 恢复 / 取消）。**与自由文本那条是两个入口**：
+      // 只接前者的话，运营发得出委托、却按不动自己那张卡上的任何按钮，
+      // 而卡片照常渲染出按钮来 —— 看着能点、点了什么都不发生。
+      delegatedTasks,
       ...publishOwnerHandlers.feishuApprovalIngress,
     });
     businessIngressStarted = true;
@@ -1397,6 +1538,9 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
   const authorities: ApiDirectAuthorities = {
     accountRoster: {
       listAccountIdentities: () => accountStore.listAccountIdentities(),
+      // 账号目录（显示名 + 别名候选）。自动化进程的委托解析按昵称选号，读的就是这一条；
+      // 守卫花名册那一条给不出这两个字段，缺了会让每一条「给<昵称>…」都回「无可用昵称」。
+      listAccountDirectory: () => accountStore.listAccountDirectory(),
     },
     accountOwnership: {
       getExecutionTarget: (accountId) => accountStore.getExecutionTarget(accountId),

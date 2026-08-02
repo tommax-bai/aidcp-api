@@ -386,3 +386,67 @@ test('API panel Facebook writes use the target-bound command client while reads 
     },
   ]);
 });
+
+test('委托任务：7+1 端口逐方法显式转调，自由文本与卡片动作两个入口都接上', async () => {
+  // 这条守的是四件都不报错、只是能力悄悄没有的事：
+  // ① 又退回 `automation_operator_command_unavailable:delegate` 那种「一调就抛」；
+  // ② 两个客户端用**对象展开**合成 —— 展开拿不到类实例原型上的方法，编译得过、真跑才现形；
+  // ③ 幂等键用随机数兜底 —— 键跨重试就变了，等于宣布这套幂等不存在；
+  // ④ 只接自由文本、不把端口交给飞书入口 —— 卡片照常渲染出按钮，点了什么都不发生。
+  const code = stripComments(await readFile(serverUrl, 'utf8'));
+
+  assert.match(code, /new DelegatedTaskHttpClient\(automationHttp, automationToken, target\)/);
+  assert.match(
+    code,
+    /new DelegatedTaskTextCommandHttpClient\(automationHttp, automationToken, target\)/,
+  );
+  assert.doesNotMatch(
+    code,
+    /automation_operator_command_unavailable:delegate/,
+    '接上之后那句「这条通道不可用」MUST 自熄',
+  );
+
+  const composed = code.slice(
+    code.indexOf('const delegatedTasks: DelegatedTaskCommandPort'),
+    code.indexOf('const personaPanel'),
+  );
+  assert.ok(composed.length > 0, '7+1 端口 MUST 在本进程合成');
+  for (const method of ['createDraft', 'confirm', 'pause', 'resume', 'cancel', 'get', 'list']) {
+    assert.match(
+      composed,
+      new RegExp(`\\b${method}:\\s*\\(`),
+      `${method} MUST 逐方法显式转调`,
+    );
+  }
+  assert.match(composed, /createFromText:\s*\(input\)\s*=>\s*text\.createFromText\(input\)/);
+  assert.doesNotMatch(
+    composed,
+    /\.\.\.\s*(seven|text)\b/,
+    '对象展开拿不到类实例原型上的方法：那种错编译得过，只有真跑起来才现形',
+  );
+
+  const face = commandFaceBlock(code);
+  assert.match(face, /delegatedTasks\.createFromText\(/, '自由文本入口 MUST 走那个端口');
+  assert.match(
+    face,
+    /operatorCommandId\(\{[\s\S]{0,200}?kind: 'delegated_task_text'/,
+    '幂等键 MUST 由飞书消息 id 算出',
+  );
+  // 只切**委托那一个闭包**：命令面里紧随其后的 `dispatch` 合法地用随机数
+  //（一次运营动作 = 一把新键，传输层重试沿用同一把），整块匹配会被它命中。
+  const delegateClosure = face.slice(
+    face.indexOf('delegate: async'),
+    face.indexOf('publish: async'),
+  );
+  assert.ok(delegateClosure.length > 0, '委托闭包 MUST 在命令面构造块里');
+  assert.doesNotMatch(
+    delegateClosure,
+    /randomUUID\(\)/,
+    '委托的幂等键 MUST NOT 用随机数兜底 —— 每次重试新随机一个等于没有幂等',
+  );
+  assert.match(
+    code,
+    /startIngress\(\{[\s\S]{0,400}?delegatedTasks,/,
+    '卡片动作那条入口 MUST 也拿到端口，否则按钮点了什么都不发生',
+  );
+});
