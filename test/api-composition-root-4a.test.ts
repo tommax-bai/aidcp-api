@@ -16,6 +16,25 @@ import {
 
 const serverUrl = new URL('../src/server.ts', import.meta.url);
 
+/**
+ * 结构断言一律读**剥掉注释**的源码：本文件里解释红线的注释本身就带着被禁的字面量
+ * （「MUST NOT 压成 `active:false`」那句），按整文件匹配会被自己的注释命中。
+ */
+function stripComments(source: string): string {
+  return source
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/\/\/[^\n]*/g, '');
+}
+
+/** 命令面构造块（到 `managementChatIds` 那个字段为止），用于把断言锚在构造处而不是整文件。 */
+function commandFaceBlock(code: string): string {
+  const start = code.indexOf('apiFeishu.createCommandFace(');
+  assert.ok(start > 0, '本进程 MUST 自己构造飞书命令面');
+  const end = code.indexOf('managementChatIds,', start);
+  assert.ok(end > start, '命令面构造块 MUST 以 managementChatIds 收尾');
+  return code.slice(start, end);
+}
+
 test('4a API root owns one API pool, 16 owner route groups, two 3b approval groups, and four outbound command clients', async () => {
   const source = await readFile(serverUrl, 'utf8');
   assert.match(source, /new pg\.Pool\(\{ \.\.\.resolveOwnerPgConfig\('api'\), max: 30 \}\)/);
@@ -52,6 +71,57 @@ test('4a API root owns one API pool, 16 owner route groups, two 3b approval grou
   ]) {
     assert.match(source, new RegExp(`new ${client}\\(`));
   }
+});
+
+test('调度启停：本进程真建那个跨进程客户端，写分三种回执、读保持三态', async () => {
+  // 这条守的是三件「不报错、只是悄悄变成假答案」的事：
+  // ① 又退回 `automation_operator_command_unavailable:dispatch` 那种「一调就抛」；
+  // ② 三种非成功回执被压成一句「失败」，运营再也分不出「没送到」与「键撞了」；
+  // ③ 状态读被 catch 成 `active:false` —— 把「读不到调度引擎」画成「引擎正常停着」，
+  //    运营看到后者什么都不会做，而真相是这条链根本不通。
+  const code = stripComments(await readFile(serverUrl, 'utf8'));
+  assert.match(
+    code,
+    /new AutomationDispatchCommandHttpClient\(\s*automationHttp,\s*automationToken,\s*target,?\s*\)/,
+    '客户端 MUST 指向 automation 且 target 由构造参数注入（调用方无从自选）',
+  );
+  assert.doesNotMatch(
+    code,
+    /automation_operator_command_unavailable:dispatch/,
+    '接上之后那句「这条通道不可用」MUST 自熄，否则台账探针分不出「没通道」与「没配通道」',
+  );
+
+  const block = commandFaceBlock(code);
+  assert.match(block, /automationDispatchCommand\.setDispatch\(/, '写 MUST 走那个客户端');
+  assert.match(block, /receipt\.outcome === 'not_delivered'/, '「没送达」MUST 单独说');
+  assert.match(block, /receipt\.outcome === 'collision'/, '「键撞了」MUST 单独说');
+  assert.match(
+    block,
+    /return receipt\.state;/,
+    '回执里的 state 与面板要的形状逐字相同，MUST 原样回传、不重组新对象',
+  );
+  assert.match(
+    block,
+    /dispatchActive: \(\) => automationDispatchCommand\.readDispatchActivity\(\)/,
+    '状态灯 MUST 原样委托给那条读，三态一路透到面板',
+  );
+  assert.doesNotMatch(
+    block,
+    /active:\s*false/,
+    '读不到 MUST NOT 被压成 active:false（这正是本文件历史上写过的那句 `() => false`）',
+  );
+});
+
+test('撤权保持读 MUST 委托客户花名册属主那一份，不在台账类里抄第二条 SQL', async () => {
+  // 台账类只实现写面（`implements Omit<…, 'hasPendingRevocationHold'>`），读面要按账号解析环境键。
+  // 抄第二份的现形方式不是报错，而是某天两份谓词漂开、一个正在被撤权的环境被重新放行。
+  // **这一处曾让本仓 typecheck 整个红着**：端口新增这个方法随同步进了本仓，
+  // 而手写入口从不同步、没人跟着补 —— 派生入口与单体入口不是同一份，第五次。
+  const code = stripComments(await readFile(serverUrl, 'utf8'));
+  assert.match(
+    code,
+    /hasPendingRevocationHold: \(accountId: string\) =>\s*clientUserStore\.hasPendingRevocationHold\(accountId\)/,
+  );
 });
 
 test('4a API root does not reconstruct automation/content graphs and Feishu is API composed', async () => {

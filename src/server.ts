@@ -104,6 +104,9 @@ import {
   registerPublishApprovalDecisionWriterRoutes,
 } from 'aidcp-transport/transport/publish-approval-decision-http.js';
 import {
+  AutomationDispatchCommandHttpClient,
+} from 'aidcp-transport/transport/operator-command-http.js';
+import {
   PublishDispatchTriggerHttpClient,
 } from 'aidcp-transport/transport/publish-dispatch-trigger-http.js';
 import { registerProviderSecretRoutes } from 'aidcp-transport/transport/provider-secret-http.js';
@@ -1167,6 +1170,18 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
     personaGenerator: new PersonaGeneratorCommandHttpClient(contentHttp, contentToken, target),
   };
 
+  /**
+   * 调度启停（运营指令，不属 4a paired command 那一族，故单独构造）：
+   * 调度引擎活在 automation 进程里，本进程读与写都得跨那一跳。
+   * 服务端那一半已在 `aidcp-automation` 的 `main()` 里注册（automation `2f5f6a9`）——
+   * **接客户端之前去对面 `main()` 里确认过路由真被注册了**，不是「客户端建得出来就算接通」。
+   */
+  const automationDispatchCommand = new AutomationDispatchCommandHttpClient(
+    automationHttp,
+    automationToken,
+    target,
+  );
+
   const personaPanel = createPersonaPanel({ store: personaStore });
   const accountPersona = new AccountPersonaService({
     generator: personaGeneratorFromCommand(pairedCommands.personaGenerator),
@@ -1310,15 +1325,32 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
     comment: async () => {
       throw new Error('automation_operator_command_unavailable:comment');
     },
-    dispatch: async () => {
-      throw new Error('automation_operator_command_unavailable:dispatch');
+    // 调度启停：语义逐条照单体的 api 模式（cloud `src/server.ts` 那两处），**不重组新形状**。
+    dispatch: async (accountId, action) => {
+      const receipt = await automationDispatchCommand.setDispatch({
+        // 一次运营动作 = 一个键。传输层重试沿用同一个键（幂等由接收方按键判），
+        // 所以这里的随机不是「每次重试新随机一个」那种把幂等键做废的写法
+        // （反面样板就在本文件上面那条 edge resume 上，见裁定文档 §3 步骤 0-b）。
+        commandId: randomUUID(),
+        accountId,
+        action,
+      });
+      // 三种非成功回执各有各的真相，MUST NOT 压成一句「失败」——用户拍板的这一版要求
+      //「点了失败给明确提示」，提示的内容就从这里来。
+      if (receipt.outcome === 'not_delivered') {
+        throw new Error(`调度指令没有送达处理器（${receipt.reason}），本次启停未生效`);
+      }
+      if (receipt.outcome === 'collision') {
+        throw new Error('同一条指令 id 被用在了另一个账号上，本次未执行');
+      }
+      // 回执里的 state 与面板要的形状**逐字相同**，原样回传。别在这里重组一个新对象：
+      // 多写一遍就多一处会漂的地方，而且漂了不报错。
+      return receipt.state;
     },
-    // **刻意不传**（cloud task 1.3a；交接文档 §4.1 早就点名了这一处）。
-    // 这里原本写的是 `() => false`——把「读不到调度引擎」答成「调度引擎正常停着」。
-    // 面板上 false 的含义是后者，运营看到它什么都不会做，而真相是这个进程根本没接那条通道。
-    // 字段是可选的（1.4a 把它改可选，正是为了让「诚实地缺席」在类型层表达得出来），
-    // 省略即回 null + 具名 `not_wired`。**MUST NOT 为了把结构填满再补一个假值。**
-    // 要在这里读到真状态，得照 cloud 组装根那样建一个指向 automation 的客户端。
+    // 状态灯：**原样回三态**（task 1.3a）。这里曾写着 `() => false`，把「读不到调度引擎」
+    // 答成「调度引擎正常停着」——面板上 false 的含义是后者，运营看到它什么都不会做。
+    // 客户端读失败时**抛**（`api_authority_unavailable`），MUST NOT 在这里 catch 成 `active:false`。
+    dispatchActive: () => automationDispatchCommand.readDispatchActivity(),
     managementChatIds,
     logger: console,
   });
@@ -1398,7 +1430,18 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
       contentSchedule,
       facebookCommentConfig,
     ),
-    offboardAdmissionLedger: new PgOffboardAdmissionLedger(pool, target),
+    // 台账类**刻意只实现写面**（它自己 `implements Omit<…, 'hasPendingRevocationHold'>`）：
+    // 读面要先按账号解析出环境键，事实源在客户花名册那边。照单体的接法**委托属主自己那一份**，
+    // MUST NOT 在台账类里把同一条 SQL 再抄一遍 —— 它的谓词与失败方向（抛，MUST NOT 吞成 false）
+    // 都是有讲究的，抄第二份的现形方式不是报错，而是某天两份谓词漂开、
+    // 一个正在被撤权的环境被重新放行。
+    offboardAdmissionLedger: Object.assign(
+      new PgOffboardAdmissionLedger(pool, target),
+      {
+        hasPendingRevocationHold: (accountId: string) =>
+          clientUserStore.hasPendingRevocationHold(accountId),
+      },
+    ),
     notificationDelivery: apiFeishu.notificationDelivery,
   };
 
@@ -1642,7 +1685,7 @@ export async function startApiService(): Promise<{
     `[aidcp-api] API owner listener active on 127.0.0.1:${port} `
       + `(target=${root.target}; 16 owner route groups; 2 approval groups; `
       + `3 sync-read groups (snapshot/changed/readiness); `
-      + `4 paired command clients; `
+      + `4 paired command clients; 1 operator command client (dispatch start/stop); `
       + `sync-read readiness=${root.syncRead.consumer.readiness().state}; `
       + `business ingress=${businessIngressStarted ? 'started' : 'blocked'})`,
   );
