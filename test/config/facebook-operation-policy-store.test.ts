@@ -5,6 +5,7 @@ import type { SchemaProber } from 'aidcp-kernel/kernel/schema-capability-contrac
 import type { MirrorVersionBumper } from '../../src/config/mirror-version-store.js';
 import { FacebookOperationPolicyStore } from '../../src/config/facebook-operation-policy-store.js';
 import { isSyncReadFactPayload } from 'aidcp-kernel/kernel/sync-read-facts.js';
+import { RISK_ACTIONS } from 'aidcp-kernel/kernel/risk-contract.js';
 
 interface PolicyRow {
   env_key: string;
@@ -25,6 +26,7 @@ interface GlobalPolicyRow {
   execution_target: 'dev' | 'ol';
   persona_reel_views_per_like: number;
   persona_reel_views_per_follow: number;
+  slow_start_reel_views_per_like: number;
   slow_start_reel_views_per_follow: number;
   rule_reel_views_per_follow: number;
   consumption_reel_views_per_follow: number;
@@ -95,6 +97,7 @@ function readySchema(withGlobal = false): SchemaProber {
         'facebook_operation_global_policy.execution_target',
         'facebook_operation_global_policy.persona_reel_views_per_like',
         'facebook_operation_global_policy.persona_reel_views_per_follow',
+        'facebook_operation_global_policy.slow_start_reel_views_per_like',
         'facebook_operation_global_policy.slow_start_reel_views_per_follow',
         'facebook_operation_global_policy.rule_reel_views_per_follow',
         'facebook_operation_global_policy.consumption_reel_views_per_follow',
@@ -184,6 +187,7 @@ function database(options: { executionTarget?: 'dev' | 'ol' } = {}) {
     execution_target: options.executionTarget ?? 'dev',
     persona_reel_views_per_like: 4,
     persona_reel_views_per_follow: 10,
+    slow_start_reel_views_per_like: 15,
     slow_start_reel_views_per_follow: 15,
     rule_reel_views_per_follow: 15,
     consumption_reel_views_per_follow: 15,
@@ -233,19 +237,20 @@ function database(options: { executionTarget?: 'dev' | 'ol' } = {}) {
         execution_target: String(params[0]) as GlobalPolicyRow['execution_target'],
         persona_reel_views_per_like: Number(params[1]),
         persona_reel_views_per_follow: Number(params[2]),
-        slow_start_reel_views_per_follow: Number(params[3]),
-        rule_reel_views_per_follow: Number(params[4]),
-        consumption_reel_views_per_follow: Number(params[5]),
-        rule_views_per_like: Number(params[6]),
-        rule_join_every_n_rounds: Number(params[7]),
-        consumption_views_per_like: Number(params[8]),
-        consumption_confirmed_likes_per_join: Number(params[9]),
-        consumption_confirmed_joins_per_comment: Number(params[10]),
-        slow_start_total_days: Number(params[11]),
-        slow_start_daily_caps: JSON.parse(String(params[12])),
-        revision: Number(params[13]),
+        slow_start_reel_views_per_like: Number(params[3]),
+        slow_start_reel_views_per_follow: Number(params[4]),
+        rule_reel_views_per_follow: Number(params[5]),
+        consumption_reel_views_per_follow: Number(params[6]),
+        rule_views_per_like: Number(params[7]),
+        rule_join_every_n_rounds: Number(params[8]),
+        consumption_views_per_like: Number(params[9]),
+        consumption_confirmed_likes_per_join: Number(params[10]),
+        consumption_confirmed_joins_per_comment: Number(params[11]),
+        slow_start_total_days: Number(params[12]),
+        slow_start_daily_caps: JSON.parse(String(params[13])),
+        revision: Number(params[14]),
         updated_at: new Date(),
-        updated_by: String(params[14]),
+        updated_by: String(params[15]),
       };
       return { rows: [{ ...globalRow }], rowCount: 1 };
     }
@@ -559,6 +564,10 @@ describe('FacebookOperationPolicyStore', () => {
     await db.store.init();
     assert.equal(db.store.getGlobal()?.executionTarget, 'dev');
     assert.equal(db.store.getGlobal()?.revision, 1);
+    assert.deepEqual(db.store.getGlobal()?.reels.slowStart, {
+      viewsPerLike: 15,
+      viewsPerFollow: 15,
+    });
 
     const inherited = await db.store.writeEnvironment(
       'env-fb',
@@ -610,7 +619,7 @@ describe('FacebookOperationPolicyStore', () => {
         },
         reels: {
           persona: { viewsPerLike: 6, viewsPerFollow: 11 },
-          slowStart: { viewsPerFollow: 16 },
+          slowStart: { viewsPerLike: 12, viewsPerFollow: 16 },
           rule: { viewsPerFollow: 17 },
           consumption: { viewsPerFollow: 18 },
         },
@@ -626,7 +635,7 @@ describe('FacebookOperationPolicyStore', () => {
       assert.equal(updated.view.slowStart.totalDays, 14);
       assert.deepEqual(updated.view.reels, {
         persona: { viewsPerLike: 6, viewsPerFollow: 11 },
-        slowStart: { viewsPerFollow: 16 },
+        slowStart: { viewsPerLike: 12, viewsPerFollow: 16 },
         rule: { viewsPerFollow: 17 },
         consumption: { viewsPerFollow: 18 },
       });
@@ -709,7 +718,12 @@ describe('FacebookOperationPolicyStore', () => {
   });
 
   it('rejects fractional and out-of-range global Reel cadence before writing audit', async () => {
-    for (const invalidViewsPerLike of [1.5, 101]) {
+    for (const [scope, invalidViewsPerLike] of [
+      ['persona', 1.5],
+      ['persona', 101],
+      ['slowStart', 1.5],
+      ['slowStart', 101],
+    ] as const) {
       const db = database({ executionTarget: 'dev' });
       await db.store.init();
       const current = db.store.getGlobal()!;
@@ -720,13 +734,10 @@ describe('FacebookOperationPolicyStore', () => {
           consumption: current.consumption,
           reels: {
             ...current.reels,
-            persona: {
-              ...current.reels.persona,
-              viewsPerLike: invalidViewsPerLike,
-            },
+            [scope]: { ...current.reels[scope], viewsPerLike: invalidViewsPerLike },
           },
           slowStart: current.slowStart,
-          requestId: `bad-reel-cadence-${invalidViewsPerLike}`,
+          requestId: `bad-reel-cadence-${scope}-${invalidViewsPerLike}`,
         },
         'panel:alice',
       );
@@ -803,9 +814,25 @@ describe('FacebookOperationPolicyStore', () => {
       ],
       '多一个键就是 invalid_envelope，少一个键是消费方读到 undefined —— 两种都会静静停掉浏览',
     );
+    // 慢启动曲线是同一条流上的全局兄弟字段（批 H 第 3 片）。这里连它一起过校验器，
+    // 是因为「手写夹具证明的是契约自洽、不是真产出物合规」——夹具照类型抄，真产出物才会带出
+    // 属主那边多出来 / 少掉的键。
+    const slowStart = db.store.slowStartRuntimePolicy();
+    assert.deepEqual(
+      Object.keys(slowStart).sort(),
+      ['dailyCaps', 'totalDays'],
+      '慢启动曲线的键集也在同一份跨进程契约里',
+    );
+    assert.deepEqual(
+      Object.keys(slowStart.dailyCaps[0]).sort(),
+      [...RISK_ACTIONS].sort(),
+      '逐日上限 MUST 覆盖全部风控动作 —— 少一项跨进程读到 undefined，'
+        + '拿去取 min 得到 NaN，那个动作的配额从此没有意义且不报错',
+    );
     assert.equal(
       isSyncReadFactPayload('facebook_operation_policy', {
         environments: db.store.baselineProjections(),
+        slowStart,
       }),
       true,
       '发布口的真产出物 MUST 能过跨进程校验器（这正是当初挂在启动期的那一跳）',

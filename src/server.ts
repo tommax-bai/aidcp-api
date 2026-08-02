@@ -1340,9 +1340,15 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
     // 发布前**先按库回读**：本进程的内存镜像可能落后于已经推进的版本游标，
     // 那会发出「新游标 + 旧基线」，消费方存下就再也不会重取（游标没变就不拉）。
     // 合成规则只在属主存储里有一份，这里 MUST NOT 用 SQL 另算一遍。
-    facebookOperationBaselines: async () => {
+    //
+    // 逐环境基线与全局慢启动曲线**在同一次刷新之后一起取**：分两次取会多出
+    // 「基线取自刷新后、曲线取自刷新前」这种错配，且两边都不报错。
+    facebookOperationPolicy: async () => {
       await facebookOperationPolicy.refreshFromAuthority();
-      return facebookOperationPolicy.baselineProjections();
+      return {
+        environments: facebookOperationPolicy.baselineProjections(),
+        slowStart: facebookOperationPolicy.slowStartRuntimePolicy(),
+      };
     },
   });
   const syncReadMirrors = new ApiSyncReadMirrors(target);
