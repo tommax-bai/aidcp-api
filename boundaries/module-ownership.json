@@ -275,6 +275,11 @@
     "note": "§4.7：alerts 表 owner（2/2 automation）"
   },
   {
+    "path": "src/api-content-scheduling.ts",
+    "layer": "composition",
+    "note": "change wire-content-scheduler-into-api-process：内容排期调度器在本进程的装配工厂。拆开之前它没有任何进程在跑——类在本仓、按分工也归本仓，而手写入口从不构造它。缺部署目标即不构造并留具名 fail-closed 日志；跨进程取用一律不加 catch（失败方向由调度器按「哪边更严」判）；扳机回执按受不受理分流。落 composition 是因为它只做装配、无属主表 SQL"
+  },
+  {
     "path": "src/cache/bot-chat-store.ts",
     "layer": "api",
     "note": "§4.7 src/cache/ 逐文件表"

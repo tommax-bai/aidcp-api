@@ -178,6 +178,15 @@ import {
 import { PublishLogStore } from './publish-agent/publish-log-store.js';
 import { createPublishUiUpdateProducer } from './publish-agent/publish-ui-update-producer.js';
 import { loadSoulFromYaml } from './soul/loader.js';
+import {
+  createApiContentSchedulerRuntime,
+  type ApiContentSchedulerRuntime,
+} from './api-content-scheduling.js';
+import { FacebookGroupJoinAutomationStore } from './config/facebook-group-join-automation-store.js';
+import { ContentSchedulingHttpClient } from 'aidcp-transport/transport/content-scheduling-http.js';
+import { FacebookPublishMediaAuthorityHttpClient } from 'aidcp-transport/transport/content-media-usage-http.js';
+import { registerScheduleFeedbackRoutes } from 'aidcp-transport/transport/api-aux-authority-http.js';
+import { isWeekActiveAt } from 'aidcp-kernel/kernel/week-active-mask.js';
 
 const DEFAULT_API_PORT = 8094;
 export const API_SYNC_READ_FULL_REFRESH_MS = 30_000;
@@ -589,6 +598,11 @@ interface ApiCompositionRoot {
   business: {
     startIngress(): Promise<void>;
   };
+  /**
+   * 内容排期调度器（change wire-content-scheduler-into-api-process）。
+   * 拆开之前它没有任何进程在跑；本进程是它按分工该在的地方。
+   */
+  contentScheduler: ApiContentSchedulerRuntime;
 }
 
 function requiredEnv(name: string): string {
@@ -1071,6 +1085,14 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
     schemaProber: probeSchemaShape,
     executionTarget: target,
   });
+  /**
+   * Facebook 自动加群的每账号配置。**本进程此前不构造它**，而排期器的独立加群动作
+   * 三道闸（开关 / 日上限 / 时段）全读它——不注入即整个加群动作静默跳过。
+   */
+  const facebookGroupJoinAutomation = new FacebookGroupJoinAutomationStore({
+    pool,
+    schemaEnsurer: migrationManagedSchema,
+  });
   const replyScopes = new ReplyConfigScopeStore({ pool });
   const publishApprovalStore = new PublishApprovalStore({
     pool,
@@ -1099,6 +1121,7 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
     facebookOperationPolicy.init(),
     personaStore.init(),
     replyScopes.init(),
+    facebookGroupJoinAutomation.init(),
     modelConfigStore.init(),
     roleConfigStore.init(),
     categoryConfigStore.init(),
@@ -1589,11 +1612,52 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
     notificationDelivery: apiFeishu.notificationDelivery,
   };
 
+  /**
+   * 内容排期调度器（change wire-content-scheduler-into-api-process）。
+   *
+   * **接之前去自动化侧的 `main()` 里逐条确认过那族路由无条件注册**
+   *（`registerContentSchedulingRoutes(root.internalServer, …)`），不是「客户端建得出来就算」。
+   * 派生服务的启动入口各自手写、从不自动同步，注册集合会悄悄少于单体；漏一条的表现是
+   * 编译过、两仓测试全绿、只有真跑两个进程才 404，而那个 404 会被读成「对面版本落后」。
+   *
+   * 令牌用的是**自动化方向那把**（与三个成对指令客户端同源）。发布授权那族另挂专用令牌、
+   * 两者不互相回落，拿错了每次都判未授权而编译期看不见。
+   */
+  const contentScheduler = createApiContentSchedulerRuntime({
+    executionTarget: target,
+    automation: new ContentSchedulingHttpClient(automationHttp, automationToken, target),
+    // 素材可用数的属主在内容服务。不接这一跳的代价不是报错，而是每一格都按 0 处置、
+    // 日志说「素材不足」而事实是根本没问——两件事的处置完全相反。
+    availablePublishMediaCount: (accountId) =>
+      new FacebookPublishMediaAuthorityHttpClient(
+        contentHttp,
+        contentToken,
+        target,
+      ).availableCount(accountId),
+    schedule: contentSchedule,
+    publishLog: publishLogStore,
+    contactAttempts: contentSchedule,
+    joinAutomationFor: (accountId) => facebookGroupJoinAutomation.getForAccount(accountId),
+    effectiveFacebookOperationMode: async (accountId) =>
+      (await facebookOperationPolicy.resolveForAccount(accountId)).mode,
+    getPlatform: async (accountId) =>
+      (await accountStore.getPlatformOrNull(accountId)) ?? 'xiaohongshu',
+    isWeekActiveAt,
+    deliver: async (input) => {
+      await apiFeishu.notificationDelivery.deliver({
+        commandId: `content-schedule:${input.accountId}:${input.title}:${Date.now()}`,
+        notification: { kind: 'command_result', input },
+      });
+    },
+    logger: console,
+  });
+
   return {
     target,
     pool,
     authorities,
     apiFeishu,
+    contentScheduler,
     pairedCommands,
     panelFacebookGroupTargets,
     publishApproval: {
@@ -1630,10 +1694,20 @@ function registerApiAuthorityRoutes(
   registerAccountPersonaRoutes(server, port.accountPersona, token, target);
   registerEnvironmentHandshakeRoutes(server, port.environmentHandshake, token, target);
   registerCommentApprovalPolicyRoutes(server, port.commentApprovalPolicy, token, target);
-  // 批 H：**排期名额回程刻意未注册** —— 本进程还没有内容排期调度器，
-  // 而那条口的属主判据是「这一格是不是我点的火」，账本就在调度器进程内。
-  // 注册一条背后没有调度器的路由，就是新造一处「看着接好了、其实永不触发」。
-  // 等本进程真的构造排期器时，连同它一起注册（automation 侧客户端已就位、缺席后果已写明）。
+  // 批 H → change wire-content-scheduler-into-api-process：**排期名额回程现在有真落点了**。
+  // 落点与本进程调度器**共用同一个方法**（`scheduler.reportNotStarted`），不是第二条写入路径 ——
+  // 小时格账本只有调度器自己那一本，第二条路径就是第二本账，而两本账一定会漂。
+  // 没有调度器的进程上调用它 MUST 响亮抛具名错误、MUST NOT 回 false：false 读作
+  //「调度器看过了、没接管」，与「这个进程根本没有调度器」完全同形，而后者是配置问题、必须有人去修。
+  registerScheduleFeedbackRoutes(
+    server,
+    {
+      reportScheduledTaskNotStarted: (accountId, action, reason) =>
+        root.contentScheduler.reportScheduledTaskNotStarted(accountId, action, reason),
+    },
+    token,
+    target,
+  );
   registerNotificationContactsRoutes(server, port.notificationContacts, token, target);
   registerFirstPostProgressRoutes(server, port.firstPostProgress, token, target);
   registerAutomationConfigCommandsRoutes(server, port.automationConfigCommands, token, target);
@@ -1770,6 +1844,10 @@ export async function startApiService(): Promise<{
         await root.business.startIngress();
         businessIngressStarted = true;
         if (closing) return;
+        // 内容排期心跳与业务入口同起：它是业务工作，就绪闸没放行之前不该到点触发任何东西。
+        // **依赖不可达不是启动闸**——跨进程那几跳问不到时由逐条失败方向处置（整轮跳过 / 跳过该账号 /
+        // 判为在跑），MUST NOT 因此拒绝启动，否则自动化服务晚起一会就永远没人来处理排期。
+        root.contentScheduler.start();
         publishApprovalRelayTimer = setInterval(
           pumpPublishApprovalOutbox,
           60_000,
@@ -1792,6 +1870,7 @@ export async function startApiService(): Promise<{
       if (activeBusinessStart) {
         await activeBusinessStart.catch(() => undefined);
       }
+      root.contentScheduler.stop();
       if (publishApprovalRelayTimer) {
         clearInterval(publishApprovalRelayTimer);
         publishApprovalRelayTimer = null;
@@ -1831,6 +1910,13 @@ export async function startApiService(): Promise<{
       + `3 sync-read groups (snapshot/changed/readiness); `
       + `4 paired command clients; 1 operator command client (dispatch start/stop); `
       + `sync-read readiness=${root.syncRead.consumer.readiness().state}; `
+      + `content scheduler=${
+        root.contentScheduler.scheduler === null
+          ? 'not constructed (deployment target invalid)'
+          : businessIngressStarted
+            ? 'running'
+            : 'constructed, waiting for business ingress'
+      }; `
       + `business ingress=${businessIngressStarted ? 'started' : 'blocked'})`,
   );
   return {
