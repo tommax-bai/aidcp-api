@@ -53,12 +53,6 @@ const ASSEMBLY_FILE = join(HERE, '..', '..', 'src', 'server.ts');
  * 这张表的作用是让「答 503」成为一个**有人签过字的决定**，而不是一次没人知道的遗漏。
  */
 const DELIBERATELY_ABSENT: Readonly<Record<string, string>> = {
-  environmentOverview:
-    'NEW_CHANNEL + KERNEL：客户端「今日进展」就是它。当日用量要 automation 属主的**任意时间窗**'
-    + ' 风控计数与活体会话用量，transport 里最接近的那条只有「今日」、无 since 入参、且是全账号扫描，'
-    + ' 顶不了分钟/小时/本场三个窗；另有 7 个纯投影函数在 api 与 kernel 里都没有。'
-    + ' ⚠ **MUST NOT 只接一半就把字段挂上去**：它的 viewForAccount 是 catch 一切回 null，'
-    + ' 而 null 与「字段缺席」在客户端上是同一句 503 —— 半接会把一次可查的缺口变成查不出来的静默故障。',
   draftRefinements:
     'NEW_CHANNEL：草稿精修属 content 域，transport 里无现成通道。切流前已知（handoff §3.1 第 3 点）。',
   interactionApi:
@@ -69,12 +63,6 @@ const DELIBERATELY_ABSENT: Readonly<Record<string, string>> = {
   onOffboardCreated:
     'NEW_CHANNEL：要 automation 侧的 dispatchPending + 往边缘推一条 envelope，'
     + ' 而 transport 里根本没有「推给边缘」这类通道。切流前已知（handoff §3.1 第 3 点）。',
-  slowStart:
-    'KERNEL：真态本身走 riskRead.slowStartView（本进程已有该口、dev 上实测答得上），'
-    + ' 但回执里的 dayQuotas 还要 omitUnsupportedUsageMetrics + pickDailyUsageCounts，'
-    + ' 它们在 automation 属主文件里、未提进 kernel（前者还牵着整张平台能力注册表）。'
-    + ' ⚠ **MUST NOT 只回 slowStart 省掉 dayQuotas**：该字段在响应里是可选的，省掉不报错，'
-    + ' 客户端会安静地少渲染一块 —— 正是「静默假成功」。',
   personaAutoFill: 'TODO：待归类（本批未调查）。',
   operatorAlias: 'TODO：待归类（本批未调查；单体里是条件展开，取决于 accountStore.setOperatorAlias 是否存在）。',
 };

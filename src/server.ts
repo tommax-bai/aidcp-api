@@ -196,6 +196,8 @@ import { PublishStatusHttpClient } from 'aidcp-transport/transport/publish-statu
 import { RiskCommandHttpClient } from 'aidcp-transport/transport/risk-command-http.js';
 import { RiskReadHttpClient } from 'aidcp-transport/transport/risk-read-http.js';
 import { CuratedContentHttpClient } from 'aidcp-transport/transport/curated-content-http.js';
+import { ClientUsageHttpClient } from 'aidcp-transport/transport/client-usage-http.js';
+import type { UiDailyUsagePayload } from './api-contracts/ui-usage-wire.js';
 import { projectClientEnvironmentSchedule } from './client-auth/client-environment-schedule.js';
 import { projectClientPublishQueue } from './client-auth/client-publish-queue.js';
 import type {
@@ -1980,6 +1982,10 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
   // 客户鉴权那侧引不到，只能各 new 一个 —— 两份客户端各自缓存、各自重试，
   // 漂开的现形方式是同一个账号在后台与客户端看到两份不同的发布队列。
   const publishStatus = new PublishStatusHttpClient(contentHttp);
+  // 客户端「今日进展」那块用量载荷的取用口。载荷类型用**本仓自己那份声明**
+  // （`api-contracts/ui-usage-wire.ts`，定稿 §10.9 管着的那一份）——传输层对载荷无知，
+  // 所以这里不产生第三个需要有人盯着的同步点。
+  const clientUsage = new ClientUsageHttpClient<UiDailyUsagePayload>(automationHttp);
   const panelStore = new PgPanelStore({ pool, automation: new PanelAutomationHttpClient(automationHttp) });
   const panelDeps: PanelDeps = {
     publishLogStore,
@@ -2199,6 +2205,100 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
     // 于是客户鉴权那侧按 name 判的「诚实回 503」会退化成 500。修法是给 listForClient
     // 补一条受鉴权版本（getOneForAccount 已经有了）。
     curatedContent: new CuratedContentHttpClient(contentHttp),
+    // 环境级慢启动的真态 + 生效后的当日上限。
+    //
+    // **两项都取自同一块用量载荷、同一次取数**：真态是 `slowStart`，当日上限是 `quotas`
+    // （属主域已经用平台能力投影摘过键）。分两次取会多出「真态取自刷新后、上限取自刷新前」
+    // 这种错配，而两边都不报错。
+    //
+    // **MUST NOT 在这里自己拼 dayQuotas**：那需要平台能力注册表，而它被终局裁定留在属主域，
+    // 本进程永远拿不到；硬拼时唯一能编译的写法是给投影传空值 —— 那不报错，
+    // 只会让 Facebook 账号重新看到「收藏 0/N」，即已被除掉的那个谎。
+    //
+    // 两项缺任一即回 null（⇒ 客户鉴权口 503）。**MUST NOT 只回真态、省掉上限**：
+    // 那个字段在响应里是可选的，省掉不报错，客户端安静地少渲染一块——「静默假成功」。
+    slowStart: {
+      viewForAccount: async (accountId) => {
+        try {
+          const usage = await clientUsage.todayUsageForAccount(accountId);
+          if (!usage.slowStart || !usage.quotas) return null;
+          // 这里的断言与单体同处一致，且**只能是断言、不能是规范化**：
+          // 载荷的键类型是可选的，而**键的缺席本身就是载荷的一部分**——属主域的平台投影
+          // 刻意摘掉了该平台不支持的那几格。任何 `?? 0` / 补全 / 遍历补键都会把摘掉的键填回 0，
+          // 于是客户端算出「0/0 今日计划已完成」，正是平台诚实投影要除掉的那句话。
+          return { slowStart: usage.slowStart, dayQuotas: usage.quotas as Record<string, number> };
+        } catch (err) {
+          console.warn(
+            `[aidcp-api] 慢启动视图取数失败 account=${accountId}: `
+              + (err instanceof Error ? err.message : String(err)),
+          );
+          return null;
+        }
+      },
+    },
+    // 客户端首页「今日进展」那一块。结构逐段照单体：三项并取 → 组当前发布态 → 最外层 catch 回 null。
+    //
+    // **失败语义分三段，一段都不能塌**：
+    //   ① 用量载荷本身由属主域装配，它内部对「首帖段」「配额段」各自 catch 成**字段缺席**
+    //      （＝诚实的「未知」，客户端据此不渲染那一块）；跨进程后这段仍在属主域执行，天然保真。
+    //   ② 四项风控计数与会话快照在属主域**不 catch、直接抛**，原样穿过传输层。
+    //   ③ 本层只在最外层 catch 一次 → `return null` → 客户鉴权口回 **503**。
+    // **MUST NOT 在这里兜一块空载荷**（如 `{ totals: {} }`）：那会让客户端把每个动作渲染成 0，
+    // 是一句错话，而且比 503 难发现得多 —— 503 会有人报障，0 不会。
+    //
+    // 日志**必须带上跨进程错误码**：`route_not_found`（对面跑的是没这条路由的旧版本）与
+    // 「对面挂了」是两件完全不同的故障，混成一句「overview failed」就等于放弃排障。
+    environmentOverview: {
+      viewForAccount: async (accountId) => {
+        try {
+          const [dailyUsage, current, last] = await Promise.all([
+            clientUsage.todayUsageForAccount(accountId),
+            publishLogStore.currentPublishForAccount(accountId),
+            publishLogStore.lastPublishedForAccount(accountId),
+          ]);
+          let currentPublishState: {
+            state: 'pending' | 'approved' | 'submitted';
+            code: string;
+            title?: string;
+            at: number;
+          } | null = null;
+          if (current) {
+            let state: 'pending' | 'approved' | 'submitted' | null;
+            if (current.status === 'submitted') state = 'submitted';
+            else if (current.status === 'scheduled') state = 'approved';
+            else {
+              const decision = await publishApprovalClient
+                .readApproval(`publish-${current.id}`)
+                .catch(() => null);
+              state = decision == null ? 'pending' : decision.approved ? 'approved' : null;
+            }
+            if (state) {
+              currentPublishState = {
+                state,
+                code: `#${current.id}`,
+                ...(current.title ? { title: current.title } : {}),
+                at: current.at,
+              };
+            }
+          }
+          return {
+            dailyUsage,
+            currentPublishState,
+            lastPublished: last?.title ? { title: last.title, at: last.at } : null,
+          };
+        } catch (err) {
+          const code =
+            err !== null && typeof err === 'object' && 'code' in err
+              ? String((err as { code: unknown }).code)
+              : 'unknown';
+          console.warn(
+            `[aidcp-api] 客户环境总览取数失败 account=${accountId} code=${code}: `
+              + (err instanceof Error ? err.message : String(err)),
+          );
+          return null;
+        }
+      },
+    },
     // 稿件三个写动作。实现本进程全有，只是没接。
     publishDraftActions: {
       // **走权威层 `publishLog`、不走裸的 `publishLogStore`**：前者在提交成功后会推一次
