@@ -463,3 +463,26 @@ test('委托任务：7+1 端口逐方法显式转调，自由文本与卡片动�
     '卡片动作那条入口 MUST 也拿到端口，否则按钮点了什么都不发生',
   );
 });
+
+test('本 main MUST 注入环境级慢启动仲裁（漏注入不报错，只让运行方式静默回落）', async () => {
+  const code = stripComments(await readFile(serverUrl, 'utf8'));
+  const block = code.slice(
+    code.indexOf('new FacebookOperationPolicyStore({'),
+    code.indexOf('new FacebookGroupJoinAutomationStore({'),
+  );
+  assert.ok(block.length > 0, '策略存储构造块 MUST 在本 main 里');
+  // 漏掉这一条 ⇒ 存储退到账号投影，那条路在本进程要跨进程问自动化，问不到就回
+  // `slow_start_projection_unavailable`；客户端上那与「这个账号确实没开慢启动」完全同形，
+  // 表现为凡跑过一次（因而绑了账号）的环境运行方式回落显示底模式、设置冷启动回读永远对不上。
+  assert.match(
+    block,
+    /environmentSlowStartResolver:\s*async \(input\) => resolveEnvironmentSlowStartState\(input\)/,
+    '锚点在本进程自己的库里，MUST 注入共享判定、MUST NOT 留给账号投影兜',
+  );
+  // 判定 MUST 取共享实现：本仓重写一份，漂开时不会报错，只会让某一侧把还在爬坡的号按满档跑。
+  assert.doesNotMatch(
+    block,
+    /AIDCP_SLOW_START_DISABLED/,
+    '判定内容 MUST 留在共享导出里，MUST NOT 在本仓复制第二份',
+  );
+});

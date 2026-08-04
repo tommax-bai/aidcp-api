@@ -159,7 +159,10 @@ import {
   API_OWNED_SYNC_READ_STREAMS,
 } from './config/api-sync-read-source.js';
 import { FacebookCommentConfigStore } from './config/facebook-comment-config-store.js';
-import { FacebookOperationPolicyStore } from './config/facebook-operation-policy-store.js';
+import {
+  FacebookOperationPolicyStore,
+  resolveEnvironmentSlowStartState,
+} from './config/facebook-operation-policy-store.js';
 import { createPersonaPanel } from './config/persona-facade.js';
 import { PersonaAutoFillStore } from './config/persona-auto-fill-store.js';
 import { PersonaAutoFillService } from './agents/persona-auto-fill.js';
@@ -1281,6 +1284,13 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
     mirrorVersionBumper: mirrorVersionStore,
     schemaProber: probeSchemaShape,
     executionTarget: target,
+    // 环境锚点 → 慢启动态。**必须在本 main 里注入**：单体在 segA 注入，而本仓自己写 main，
+    // 漏掉不会报错——策略存储会退到账号投影那条路，那条路在本进程要跨进程问自动化，
+    // 问不到就诚实回 `slow_start_projection_unavailable`。于是凡跑过一次（因而绑了账号）的
+    // 环境，客户端「运行方式」一律回落显示底模式、设置冷启动的回读永远对不上（2026-08-04 实测）。
+    // 锚点在本进程自己的库里、判定纯粹是算术，这条路本就不该有跨进程依赖。
+    // 判定取共享实现，**MUST NOT 在本仓重写一份**。
+    environmentSlowStartResolver: async (input) => resolveEnvironmentSlowStartState(input),
   });
   /**
    * Facebook 自动加群的每账号配置。**本进程此前不构造它**，而排期器的独立加群动作
