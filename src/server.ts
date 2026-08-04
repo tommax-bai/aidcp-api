@@ -1,6 +1,5 @@
 import pg from 'pg';
 import { randomUUID } from 'node:crypto';
-import { pathToFileURL } from 'node:url';
 import { parseDeploymentTarget, type DeploymentTarget } from 'aidcp-kernel/deployment-target.js';
 import {
   isSyncReadFactPayload,
@@ -187,6 +186,10 @@ import { ContentSchedulingHttpClient } from 'aidcp-transport/transport/content-s
 import { FacebookPublishMediaAuthorityHttpClient } from 'aidcp-transport/transport/content-media-usage-http.js';
 import { registerScheduleFeedbackRoutes } from 'aidcp-transport/transport/api-aux-authority-http.js';
 import { isWeekActiveAt } from 'aidcp-kernel/kernel/week-active-mask.js';
+import {
+  API_PG_OWNERS,
+  type ApiSchemaGateReceipt,
+} from './api-schema-gate-startup.js';
 
 const DEFAULT_API_PORT = 8094;
 export const API_SYNC_READ_FULL_REFRESH_MS = 30_000;
@@ -1790,11 +1793,62 @@ function registerApiSyncReadReadinessRoute(
   );
 }
 
-export async function startApiService(): Promise<{
+/**
+ * 本进程一条能力的启动结论。**注册了什么与没注册什么由同一个数组得出**——
+ * 两份各写各的清单必然漂，而漂了之后「日志说注册了」与「实际注册了」不再是同一件事。
+ */
+export interface ApiStartupCapability {
+  name: string;
+  registered: boolean;
+  /** 未注册时**必须**具名说清依赖缺在哪；已注册时留空。 */
+  reason?: string;
+}
+
+/**
+ * 启动日志里那句「注册了什么 / 没注册什么」。
+ *
+ * 缺席一律显式说出，**MUST NOT 与「已注册且空闲」同形**：后者是正常态，前者是配置或依赖
+ * 出了问题、需要有人去修，而两者在「进程活着、端口通」这个维度上完全一样。
+ */
+export function formatApiCapabilityRoster(
+  capabilities: readonly ApiStartupCapability[],
+): string {
+  const registered = capabilities.filter((entry) => entry.registered).map((entry) => entry.name);
+  const absent = capabilities.filter((entry) => !entry.registered);
+  const absentText =
+    absent.length === 0
+      ? '无'
+      : absent.map((entry) => `${entry.name}（${entry.reason ?? '原因未具名'}）`).join('、');
+  return `已注册=${registered.length === 0 ? '无' : registered.join('、')}；未注册=${absentText}`;
+}
+
+export async function startApiService(options: {
+  /**
+   * schema 契约门跑过了的回执。**必填、无缺省，且外部造不出来**
+   * （只能由 {@link runApiStartupSchemaGate} 返回）。
+   *
+   * 它在这里是为了把「门必须先跑、且跑在建池之前」变成编译期可见的顺序约束：
+   * 本函数第一句就建池（`buildApiCompositionRoot`），门若跑在它之后，落后的 schema
+   * 会先被打开连接、再由某个存储在某次调用上炸掉，而不是在启动那一刻被挡住。
+   * 而「没调门」在行为上什么都不表现 ⇒ 行为测试原理上看不见它，只能由类型担保。
+   */
+  schemaGate: ApiSchemaGateReceipt;
+}): Promise<{
   port: number;
   readiness(): SyncReadProcessReadiness;
   close(): Promise<void>;
 }> {
+  // 门判过的属主集合 MUST 与本进程真正建池的属主集合逐个吻合——对不上即拒绝启动，不是告警。
+  // 判少了：真在用的库没被校验过（门看着绿、其实什么都没校验到）；
+  // 判多了：本进程根本不连那个库，却在替它的 schema 背书。
+  const judged = [...options.schemaGate.owners].sort().join(',');
+  const opened = [...API_PG_OWNERS].sort().join(',');
+  if (judged !== opened) {
+    throw new Error(
+      `schema_gate_owner_scope_mismatch: 门判了 [${judged}]，本进程建池 [${opened}]。`
+        + '两者必须一致——否则要么真在用的库没被校验，要么在替本进程不连的库背书。',
+    );
+  }
   const root = await buildApiCompositionRoot();
   const server = new InternalHttpServer();
   registerApiAuthorityRoutes(server, root);
@@ -1904,11 +1958,25 @@ export async function startApiService(): Promise<{
     await stopService();
     throw error;
   }
+  // 能力清单：注册了什么与没注册什么由**同一个数组**得出（见 formatApiCapabilityRoster）。
+  const capabilities: ApiStartupCapability[] = [
+    { name: 'api-owner-authorities', registered: true },
+    { name: 'publish-approval-authorities', registered: true },
+    { name: 'sync-read(snapshot/changed/readiness)', registered: true },
+    root.contentScheduler.scheduler === null
+      ? {
+          name: 'content-scheduling',
+          registered: false,
+          // 「没构造出来」与「构造了但还没放行」是两件事，前者是配置问题、要人去修。
+          reason: '部署目标非法 ⇒ 调度器未构造；排期心跳在本进程永不推进',
+        }
+      : { name: 'content-scheduling', registered: true },
+  ];
   console.log(
     `[aidcp-api] API owner listener active on 127.0.0.1:${port} `
-      + `(target=${root.target}; 16 owner route groups; 2 approval groups; `
-      + `3 sync-read groups (snapshot/changed/readiness); `
-      + `4 paired command clients; 1 operator command client (dispatch start/stop); `
+      + `(target=${root.target}; schema 门=${options.schemaGate.mode}/`
+      + `${options.schemaGate.pass ? '通过' : '未通过'}; `
+      + `${formatApiCapabilityRoster(capabilities)}; `
       + `sync-read readiness=${root.syncRead.consumer.readiness().state}; `
       + `content scheduler=${
         root.contentScheduler.scheduler === null
@@ -1926,9 +1994,10 @@ export async function startApiService(): Promise<{
   };
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  startApiService().catch((error) => {
-    console.error('[aidcp-api] startup failed:', error);
-    process.exitCode = 1;
-  });
-}
+// 可执行入口在 `src/api-service-entry.ts`，**不在本文件**。
+//
+// 本文件此前靠 `import.meta.url === pathToFileURL(process.argv[1]).href` 自举，且失败时只设
+// `process.exitCode`、不真退出 —— 组装根在 try/catch 之外被裸 await ⇒ 已建的池永不 `end()`
+// ⇒ 进程很可能压根不退出，systemd 看到的是 `active (running)` 的僵尸：既不服务，也不重启。
+// 三个进程的启动外壳因此统一到一种形态（读配置 → 门 → 建根 → 先监听 → 就绪闸 → 放行业务 →
+// 优雅关停 → 信号），入口独立成文件是那条形态的一部分。
