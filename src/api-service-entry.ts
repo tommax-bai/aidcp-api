@@ -67,6 +67,12 @@ export async function runApiEntry(options: ApiEntryOptions = {}): Promise<void> 
       .close()
       .then(() => {
         logger.log('[aidcp-api] 已关停');
+        // **关停干净就必须以 0 退出。**
+        // 摘掉信号处理器之后，同一次信号会落回 Node 的默认处置 ⇒ 进程以 143（128+SIGTERM）结束，
+        // 而 systemd 把非 0 一律记成 `failed`。dev 上实测过：一次完全正常的停机在
+        // `systemctl status` 里显示 failed —— 「干净停下」与「崩了」从进程管理器那一侧完全同形，
+        // 而那正是运维唯一会看的那一眼。
+        exit(0);
       })
       .catch((error: unknown) => {
         logger.error('[aidcp-api] 优雅关停失败：', error);

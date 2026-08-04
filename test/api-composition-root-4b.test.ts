@@ -25,6 +25,7 @@ import {
 import { SyncReadSnapshotHttpClient } from 'aidcp-transport/transport/sync-read-snapshot-http.js';
 
 import { ApiSyncReadMirrors } from '../src/config/api-sync-read-mirrors.js';
+import { API_OWNED_SYNC_READ_STREAMS } from '../src/config/api-sync-read-source.js';
 import {
   API_SYNC_READ_CHANGED_STREAMS,
   API_SYNC_READ_CONSUMED_STREAMS,
@@ -319,15 +320,16 @@ test('4b API owner route serves only B1/B2/B4/B5 streams with target-bound auth'
   } finally {
     await server.close();
   }
-  assert.deepEqual(API_SYNC_READ_OWNED_STREAMS, [
-    'account_persona',
-    'client_environment_automation',
-    'automation_account_projection',
-    'content_schedule',
-    'hot_lead_config',
-    'facebook_comment_config',
-    'facebook_group_join_automation_config',
-  ]);
+  // **按引用断，别再抄第四份。** 这里原本手抄了一份七条的字面量，而属主源那份是八条
+  // （多 `facebook_operation_policy`）—— 用例因此把「注册清单漏了一条」这件事一起钉成了「正确」。
+  // 真实后果在 dev 上实测过：自动化进程的消费方永远拿不到那条流 ⇒ 就绪度永远 not_ready ⇒
+  // 业务入口永不放行 ⇒ 边-云端口不监听、边缘一台都连不上。
+  assert.equal(
+    API_SYNC_READ_OWNED_STREAMS,
+    API_OWNED_SYNC_READ_STREAMS,
+    '注册用的流集合 MUST 与属主源那份是同一个清单，不是内容相同的第二份',
+  );
+  assert.ok(API_SYNC_READ_OWNED_STREAMS.includes('facebook_operation_policy'));
 });
 
 test('4b changed ingress ACKs A3-A6 only after generation-bound fetch, apply, and checkpoint save', async () => {

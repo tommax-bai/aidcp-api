@@ -135,7 +135,10 @@ import {
 } from './config/content-schedule-store.js';
 import { createApiSyncReadConsumerCheckpointStore } from './config/api-sync-read-checkpoint-store.js';
 import { ApiSyncReadMirrors } from './config/api-sync-read-mirrors.js';
-import { ApiSyncReadSnapshotSource } from './config/api-sync-read-source.js';
+import {
+  ApiSyncReadSnapshotSource,
+  API_OWNED_SYNC_READ_STREAMS,
+} from './config/api-sync-read-source.js';
 import { FacebookCommentConfigStore } from './config/facebook-comment-config-store.js';
 import { FacebookOperationPolicyStore } from './config/facebook-operation-policy-store.js';
 import { createPersonaPanel } from './config/persona-facade.js';
@@ -235,15 +238,14 @@ export const API_SYNC_READ_CHANGED_STREAMS = [
   'automation_config_mirror_health',
 ] as const satisfies readonly SyncReadChangedStream[];
 
-export const API_SYNC_READ_OWNED_STREAMS = [
-  'account_persona',
-  'client_environment_automation',
-  'automation_account_projection',
-  'content_schedule',
-  'hot_lead_config',
-  'facebook_comment_config',
-  'facebook_group_join_automation_config',
-] as const satisfies readonly SyncReadStream[];
+/**
+ * 本进程注册快照路由的流集合。**从属主源那份唯一清单取，MUST NOT 在这里再抄一份。**
+ *
+ * 抄第二份的代价实测过：这里曾比属主源少一条 `facebook_operation_policy`，
+ * 于是自动化进程的消费方永远拿不到那条流 ⇒ 就绪度永远 not_ready ⇒ 业务入口永不放行 ⇒
+ * **边-云端口不监听、边缘一台都连不上**，而本进程自己一切正常、日志一句异常都没有。
+ */
+export const API_SYNC_READ_OWNED_STREAMS = API_OWNED_SYNC_READ_STREAMS;
 
 type ApiConsumedSyncReadStream =
   (typeof API_SYNC_READ_CONSUMED_STREAMS)[number];
