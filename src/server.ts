@@ -161,6 +161,9 @@ import {
 import { FacebookCommentConfigStore } from './config/facebook-comment-config-store.js';
 import { FacebookOperationPolicyStore } from './config/facebook-operation-policy-store.js';
 import { createPersonaPanel } from './config/persona-facade.js';
+import { PersonaAutoFillStore } from './config/persona-auto-fill-store.js';
+import { PersonaAutoFillService } from './agents/persona-auto-fill.js';
+import { InteractionOffboardHttpClient } from 'aidcp-transport/transport/interaction-offboard-http.js';
 import { PersonaStore } from './config/persona-store.js';
 import { CategoryConfigStore } from './config/category-config-store.js';
 import { CredentialStore } from './config/credential-store.js';
@@ -1501,7 +1504,25 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
     };
   })();
 
+  // ⚠ 已知残留（登记在 test/acceptance/client-auth-deps-inventory.test.ts）：单体这里还传
+  // `onBound` / `onChanged` 两个钩子 —— 前者让绑上人设的账号**就地开跑**，后者把绑定态**推给客户端**。
+  // 两者的落点（会话唤醒面、推给边缘面）在 transport 里都还没有通道，本进程给不出。
+  // 后果**不是报错**：人设确实写进库了、run 会变成成功，但账号不动、客户端不翻「已设置」——
+  // 每一层都报成功，而这个能力的意义正是那后半截。**别把它读成已经闭环。**
   const personaPanel = createPersonaPanel({ store: personaStore });
+  // 人设自助补齐。**显式传本进程的 pool**：这个 options 的 pool 是可选的，不传会自建一个
+  // 连默认库的池 —— 物理拆库之后那是个不存在的库，而且**启动期不报错、第一次写才炸**。
+  const personaAutoFillStore = new PersonaAutoFillStore({
+    pool,
+    schemaEnsurer: migrationManagedSchema,
+  });
+  const personaAutoFill = new PersonaAutoFillService({
+    store: personaAutoFillStore,
+    clientUsers: clientUserStore,
+    personas: personaStore,
+    personaPanel,
+    logger: console,
+  });
   const accountPersona = new AccountPersonaService({
     generator: personaGeneratorFromCommand(pairedCommands.personaGenerator),
     facade: personaPanel,
@@ -1852,7 +1873,13 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
     interactionApiWrites: new PgInteractionApiWrites(pool),
     replyConfig: new ReplyConfigResolver(replyScopes),
     accountPersona,
-    environmentHandshake: createEnvironmentHandshakeAuthority(clientUserStore),
+    // **第二个参数必须传**：它是 `waiting_binding` 那一态**唯一**的唤醒源。
+    // 客户提交人设时，名下那些还没绑账号的环境会被记成 waiting_binding；
+    // 而进程重启时的 `resume()` 明确不管这一态（它只捞 pending 与超时的 running）。
+    // 不传的后果**不是报错**：编译过、启动无声、run 是合法的 running、客户端拿到 201，
+    // 只是那个环境的人设**永远补不上**——比 503 难发现得多。
+    environmentHandshake: createEnvironmentHandshakeAuthority(clientUserStore, (envKey) =>
+      personaAutoFill.notifyEnvironmentBound(envKey)),
     commentApprovalPolicy: approvalPolicy,
     notificationContacts,
     firstPostProgress,
@@ -1986,6 +2013,8 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
   // （`api-contracts/ui-usage-wire.ts`，定稿 §10.9 管着的那一份）——传输层对载荷无知，
   // 所以这里不产生第三个需要有人盯着的同步点。
   const clientUsage = new ClientUsageHttpClient<UiDailyUsagePayload>(automationHttp);
+  /** 客户提交离场后的即时派发触发。目标边缘由属主进程解析，本进程只给 accountId。 */
+  const interactionOffboard = new InteractionOffboardHttpClient(automationHttp);
   const panelStore = new PgPanelStore({ pool, automation: new PanelAutomationHttpClient(automationHttp) });
   const panelDeps: PanelDeps = {
     publishLogStore,
@@ -2298,6 +2327,19 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
           return null;
         }
       },
+    },
+    // 运营别名。上游只有本进程这一个存储，签名逐参对齐，直接绑。
+    // 单体那处的条件展开在本仓是类型噪音（那边 accountStore 静态类型可空），别照抄。
+    operatorAlias: { setForAccount: accountStore.setOperatorAlias.bind(accountStore) },
+    // 人设自助补齐。**注意它只完成了一半闭环**，另一半（绑上人设后账号就地开跑、
+    // 绑定态推给客户端）缺两个 transport 里还不存在的通道，见 personaPanel 那处的说明。
+    personaAutoFill,
+    // 客户提交离场后的即时派发。**不在这里解析 edgeId**：推送目标由属主进程就地解析
+    // （见通道文件头）。accountId 为 null = 已受理、属主还没物化出账号 —— 此刻没有可派发的
+    // 目标，MUST NOT 猜一个；物化成功后会带着真 accountId 再走一次。
+    onOffboardCreated: async (offboard) => {
+      if (!offboard.accountId) return;
+      await interactionOffboard.dispatchPendingOffboards(offboard.accountId);
     },
     // 稿件三个写动作。实现本进程全有，只是没接。
     publishDraftActions: {

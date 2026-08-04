@@ -60,11 +60,6 @@ const DELIBERATELY_ABSENT: Readonly<Record<string, string>> = {
     + ' 同步返回 string、跨 HTTP 后签名要改成 Promise）在 transport 里零通道；另有一条已写好的'
     + ' reader 通道在 automation 侧从未 register（客户端建得出来、对面 404）。'
     + ' 注意这项缺席时客户端拿到的是 **404 整片路由消失**，不是 503。',
-  onOffboardCreated:
-    'NEW_CHANNEL：要 automation 侧的 dispatchPending + 往边缘推一条 envelope，'
-    + ' 而 transport 里根本没有「推给边缘」这类通道。切流前已知（handoff §3.1 第 3 点）。',
-  personaAutoFill: 'TODO：待归类（本批未调查）。',
-  operatorAlias: 'TODO：待归类（本批未调查；单体里是条件展开，取决于 accountStore.setOperatorAlias 是否存在）。',
 };
 
 /** 抠出 `export interface ClientAuthDeps { … }` 的**顶层**字段名。 */

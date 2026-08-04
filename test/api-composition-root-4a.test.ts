@@ -126,10 +126,23 @@ test('撤权保持读 MUST 委托客户花名册属主那一份，不在台账�
 
 test('4a API root does not reconstruct automation/content graphs and Feishu is API composed', async () => {
   const source = await readFile(serverUrl, 'utf8');
+  // `src/agents/` 整目录归 automation —— **唯一例外是 `persona-auto-fill.ts`**：归属表里它是
+  // api 属主，也是本仓 `src/agents/` 下唯一被同步过来的文件。所以这里不能再用「整个
+  // ./agents/ 都不许」那条粗判 —— 它会把一个本进程该构造的服务一起拦掉，而拦掉的代价
+  // 不是编译错误，是客户提交人设之后**永远补不上**（见组装根里那处说明）。
+  // 例外必须是**点名的**：任何其它 `./agents/` 导入仍然当场红。
+  const agentsImports = [...source.matchAll(/from '\.\/agents\/([^']+)'/g)]
+    .map((m) => m[1])
+    .sort();
+  assert.deepEqual(
+    agentsImports,
+    ['persona-auto-fill.js'],
+    '接口进程的组装根只许 import 归属为 api 的那一个 agents 文件；实际导入了：'
+      + (agentsImports.join(', ') || '(无)'),
+  );
   for (const forbidden of [
     "'./risk/",
     "'./comm/",
-    "'./agents/",
     "'./orchestrator/",
     "'./llm/",
     'RiskController',
