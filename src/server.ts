@@ -40,7 +40,6 @@ import type {
 import type {
   SchemaEnsurer,
   SchemaProber,
-  SchemaShape,
 } from 'aidcp-kernel/kernel/schema-capability-contract.js';
 import type { FacebookGroupOpsPort } from 'aidcp-kernel/kernel/facebook-group-ops-types.js';
 import type { PersonaGeneratorPort } from 'aidcp-kernel/kernel/persona-ports.js';
@@ -181,6 +180,7 @@ import {
   PanelResumeConfigHttpClient,
 } from 'aidcp-transport/transport/panel-config-http.js';
 import { registerPanelEventDeliveryRoutes } from 'aidcp-transport/transport/panel-event-delivery-http.js';
+import { probeSchemaShape as probeSchemaShapeFromTransport } from 'aidcp-transport/schema/schema-capability.js';
 import { createClientPublishApprovalHandler } from './publish-agent/client-publish-approval.js';
 import { createPublishDraftImageRemoveHandler } from './publish-agent/draft-image-remove.js';
 import {
@@ -787,23 +787,18 @@ const migrationManagedSchema: SchemaEnsurer = async (client, spec) => {
   return 'ready';
 };
 
-const probeSchemaShape: SchemaProber = async (client, tables): Promise<SchemaShape> => {
-  const result = await client.query(
-    `SELECT candidate AS relname
-       FROM unnest($1::text[]) AS candidate
-      WHERE to_regclass(candidate) IS NOT NULL`,
-    [tables],
-  );
-  return {
-    tables: new Set(
-      result.rows
-        .map((row) => row.relname)
-        .filter((name): name is string => typeof name === 'string'),
-    ),
-    columns: new Set(),
-    indexes: new Set(),
-  };
-};
+/**
+ * 形状探测：**用共享包那一份，别在这里另写一个**。
+ *
+ * 本文件此前有一份手写的：只查表在不在，`columns` 与 `indexes` **恒返回空集合**。
+ * 它满足类型、编译全过、单测也不碰它；但凡「要求里带列或索引」的能力，判定都必然不是 ready ——
+ * 表现是**进程启动直接失败**，错误文案还逐条列出那些**其实一个不缺**的列
+ * （实测：本进程连的 aidcp_api 库里那三张表与全部列都在，是这份探测看不见列）。
+ *
+ * 这类「答得出形状、答的却是空」的桩比缺席更贵：缺席会报未实现，空答案把排查引向数据库。
+ */
+const probeSchemaShape: SchemaProber = (client, tables) =>
+  probeSchemaShapeFromTransport(client, tables);
 
 function personaGeneratorFromCommand(
   command: PersonaGeneratorAuthorityPort,
