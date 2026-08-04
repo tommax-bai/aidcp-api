@@ -5,6 +5,7 @@ import {
   isSyncReadFactPayload,
   type SyncReadPayloadByStream,
 } from 'aidcp-kernel/kernel/sync-read-facts.js';
+import { parseSyncReadPersonaSoul } from 'aidcp-kernel/kernel/persona-soul-parse.js';
 import {
   compareUnsignedSyncReadCursor,
   SyncReadConsumerCheckpointStore,
@@ -203,7 +204,6 @@ import {
 } from './publish-agent/publish-approval-store.js';
 import { PublishLogStore } from './publish-agent/publish-log-store.js';
 import { createPublishUiUpdateProducer } from './publish-agent/publish-ui-update-producer.js';
-import { loadSoulFromYaml } from './soul/loader.js';
 import {
   createApiContentSchedulerRuntime,
   type ApiContentSchedulerRuntime,
@@ -655,6 +655,21 @@ function readOptionalPort(name: string): number | null {
     throw new Error(`${name} must be an integer in 1..65535`);
   }
   return port;
+}
+
+/**
+ * 「这台机器上哪些端口不归我」的人工名单（单体一直读的那个键）。
+ *
+ * 它不是配置项而是**护栏**：dev 同机另有一整套别人的服务，把面板口配错成邻居的端口时，
+ * 表现不是启动失败而是**把对方顶掉**。派生进程此前不读这个键 —— 护栏在搬家路上掉了，
+ * 而掉了这件事没有任何现象，直到真配错那一次。
+ */
+function parseForbiddenPorts(raw: string | undefined): number[] {
+  if (!raw) return [];
+  return raw
+    .split(',')
+    .map((item) => Number(item.trim()))
+    .filter((port) => Number.isInteger(port) && port > 0);
 }
 
 function requiredEnv(name: string): string {
@@ -1578,8 +1593,12 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
   const syncReadOwnerSource = new ApiSyncReadSnapshotSource({
     executionTarget: target,
     pool,
-    parseSoul: (personaText) =>
-      JSON.parse(JSON.stringify(loadSoulFromYaml(personaText))) as SyncReadJson,
+    // **按引用取用共享包那一份**，MUST NOT 在此就地实现「解析 + 归一 + 失败回 null」。
+    // 此前这里用的是本仓通用装载器（它会带上 api 段自管的 engagement_rules 等字段、
+    // 且不带兜底），单体那一侧用的是人设闭子集编解码器 —— 同一份人设文本解出两种结构，
+    // 同一个游标发出两种载荷摘要，消费方按设计整条拒收，而两侧的行为测试各自全绿。
+    // 2026-08-04 dev 切流演练实测过一次（游标 902）。
+    parseSoul: parseSyncReadPersonaSoul,
     // 发布前**先按库回读**：本进程的内存镜像可能落后于已经推进的版本游标，
     // 那会发出「新游标 + 旧基线」，消费方存下就再也不会重取（游标没变就不拉）。
     // 合成规则只在属主存储里有一份，这里 MUST NOT 用 SQL 另算一遍。
@@ -2069,7 +2088,12 @@ export async function startApiService(options: {
       jwtTtlSeconds: Number(process.env.AIDCP_PANEL_JWT_TTL_SECONDS ?? 3600),
       // 自检名单：本进程自己的内部口 + PG + 客户鉴权口。**两个对外口互相回避**，
       // 撞上即拒绝绑定，而不是把另一条服务顶掉。
-      forbiddenPorts: [port, 5432, ...(root.clientAuth.port ? [root.clientAuth.port] : [])],
+      forbiddenPorts: [
+        port,
+        5432,
+        ...(root.clientAuth.port ? [root.clientAuth.port] : []),
+        ...parseForbiddenPorts(process.env.AIDCP_PANEL_FORBIDDEN_PORTS),
+      ],
       logger: console,
     });
     if (!panelHandle.started) {
@@ -2093,7 +2117,12 @@ export async function startApiService(options: {
       // 只为那条「与面板密钥相同即拒启」的断言而传：密钥即边界，两边同一把等于边界坍塌。
       panelJwtSecret: process.env.AIDCP_PANEL_JWT_SECRET ?? '',
       jwtTtlSeconds: Number(process.env.AIDCP_CLIENT_JWT_TTL_SECONDS ?? 900),
-      forbiddenPorts: [port, 5432, ...(root.panel.port ? [root.panel.port] : [])],
+      forbiddenPorts: [
+        port,
+        5432,
+        ...(root.panel.port ? [root.panel.port] : []),
+        ...parseForbiddenPorts(process.env.AIDCP_PANEL_FORBIDDEN_PORTS),
+      ],
       logger: console,
     });
     if (!clientAuthHandle.started) {
