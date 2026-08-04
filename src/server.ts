@@ -120,6 +120,22 @@ import {
 } from 'aidcp-transport/transport/publish-dispatch-trigger-http.js';
 import { registerProviderSecretRoutes } from 'aidcp-transport/transport/provider-secret-http.js';
 import { registerRoleModelSelectionRoutes } from 'aidcp-transport/transport/role-model-selection-http.js';
+// 内容进程要用的那六族 + 配置镜像失效信号的落地端。单体在它的 api 内部 API 装配里全注册了，
+// 本仓的手写 main 一族都没接 —— 表现不是编译错误，而是对面运行期 `no route`。
+import { registerReviewCardDeliveryRoutes } from 'aidcp-transport/transport/review-card-delivery-http.js';
+import { registerPublishLogRoutes } from 'aidcp-transport/transport/publish-log-http.js';
+import { registerPipelineLogRoutes } from 'aidcp-transport/transport/pipeline-log-http.js';
+import { registerPublishCardExitRoutes } from 'aidcp-transport/transport/publish-card-exit-http.js';
+import { registerImageModelSelectionRoutes } from 'aidcp-transport/transport/image-model-selection-http.js';
+import { registerAccountPlatformRoutes } from 'aidcp-transport/transport/account-platform-http.js';
+import { registerConfigMirrorBumpRoutes } from 'aidcp-transport/transport/config-mirror-bump-http.js';
+import type { ReviewCardDeliveryPort } from 'aidcp-kernel/kernel/review-card-delivery-port.js';
+import type { PublishLogWriter } from 'aidcp-kernel/kernel/publish-log-writer-port.js';
+import type { PipelineLogSink } from 'aidcp-kernel/kernel/pipeline-log-contract.js';
+import type { PublishCardExitPort } from 'aidcp-kernel/kernel/publish-card-exit-port.js';
+import type { ImageModelSelectionSource } from 'aidcp-kernel/kernel/image-model-selection-port.js';
+import type { AccountPlatformReader } from 'aidcp-kernel/kernel/platform-types.js';
+import type { ConfigMirrorBumpSink } from 'aidcp-kernel/kernel/config-mirror-bump-types.js';
 import { PgAccountStore } from './account-store.js';
 import { AccountStateManager } from './account-state.js';
 import { NotificationContactStore } from './cache/notification-contact-store.js';
@@ -147,6 +163,8 @@ import { PersonaStore } from './config/persona-store.js';
 import { CategoryConfigStore } from './config/category-config-store.js';
 import { CredentialStore } from './config/credential-store.js';
 import { ModelConfigStore } from './config/model-config-store.js';
+import { MirrorVersionStore } from './config/mirror-version-store.js';
+import { PgConfigMirrorBumpSink } from './config/mirror-bump-sink.js';
 import { RoleConfigStore } from './config/role-config-store.js';
 import { ROLE_CATALOG, categoryOf, type ThinkingMode } from './config/role-catalog.js';
 import type {
@@ -203,6 +221,7 @@ import {
   PublishApprovalStore,
 } from './publish-agent/publish-approval-store.js';
 import { PublishLogStore } from './publish-agent/publish-log-store.js';
+import { PublishPipelineLogStore } from './publish-agent/publish-pipeline-log-store.js';
 import { createPublishUiUpdateProducer } from './publish-agent/publish-ui-update-producer.js';
 import {
   createApiContentSchedulerRuntime,
@@ -623,7 +642,24 @@ interface ApiCompositionRoot {
   contentReads: {
     roleModelSelectionSource: RoleModelSelectionSource;
     providerSecretReader: ProviderSecretReader;
+    imageModelSelection: ImageModelSelectionSource;
+    /** 属主缺 `getPlatformOrNull` ⇒ undefined ⇒ **不注册该路由**（绝不注册一条注定 500 的）。 */
+    accountPlatform: AccountPlatformReader | undefined;
+    reviewCardDelivery: ReviewCardDeliveryPort;
+    publishLogWriter: PublishLogWriter;
+    pipelineLogSink: PipelineLogSink;
   };
+  /**
+   * 飞书出口（候审卡 / 指令结果 / 图片上传 / 默认会话解析 / 审批信号），属主是本进程的飞书段。
+   * 单列一条是因为它比 `contentReads` 晚构造（要先有飞书段），不是因为语义不同。
+   * 六条方法里只有写审批信号那条带 bearer，令牌与内容进程那侧同一个 env 键。
+   */
+  contentPublishCardExit: PublishCardExitPort;
+  /**
+   * 跨域配置镜像失效信号的**落地端**。生产方是 automation（它不该持有本域库的连接），
+   * 经内部 HTTP 把 bump 推给本进程，由本进程在 api 库里一笔事务做「inbox 去重 + 推版本」。
+   */
+  configMirrorBumpSink: ConfigMirrorBumpSink;
   business: {
     startIngress(): Promise<void>;
   };
@@ -1100,6 +1136,27 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
     schemaEnsurer: migrationManagedSchema,
     schemaProber: probeSchemaShape,
   });
+  // 发布管线角色执行日志（`publish_pipeline_logs`，本域属主表）。**必须显式传池**：
+  // 这个存储的构造参数缺省会自建一个连自己默认库的池 —— 物理拆库之后那是一个不存在的库，
+  // 而它不在启动期报错，只会在第一次写日志时炸，且炸在内容进程那一侧看起来像「对面挂了」。
+  // 本进程自己不写它，构造只为把那条路由喂给内容进程。
+  const publishPipelineLogStore = new PublishPipelineLogStore({ pool });
+  /**
+   * 配置镜像失效信号的**落地端**：本域库里一笔事务做「按去重键入 inbox + 推版本」。
+   *
+   * **不调 versionStore.init()**：那是一条 `CREATE TABLE IF NOT EXISTS` 的运行期建表路径，
+   * 而本仓的 schema 只由迁移管（0062 / 0076 已建两张表）。
+   *
+   * ⚠️ **生产方那一侧今天还没接线**：自动化进程既没建失效信号的中继、
+   * 四个限频配置存储也都没传版本推进器 ⇒ 这条通道两端里只有本端就位。
+   * 照样注册路由，理由与面板事件入口那条相同：先让「对面接得住」成立，
+   * 免得接生产方那天才发现路由根本不存在。缺的另一半已具名登记，MUST NOT 读成「补完这里就通了」。
+   */
+  const configMirrorBumpSink: ConfigMirrorBumpSink = new PgConfigMirrorBumpSink({
+    pool,
+    versionStore: new MirrorVersionStore({ pool }),
+    logger: console,
+  });
   const clientUserStore = new ClientUserStore({
     pool,
     executionTarget: target,
@@ -1256,6 +1313,68 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
     providerSecretReader: {
       getSecretForRuntime: (provider, field) => credentialStore.getSecretForRuntime(provider, field),
     } satisfies ProviderSecretReader,
+    // 图片模型选择：内容进程的调用点是**同步**的、在热闭包里，所以跨进程形态是
+    // 「异步取源 + 对面本地镜像」，而不是一个 HTTP 客户端。本进程只负责取源那一半。
+    // 对面取不到时的表现是「沿用保守默认」并每分钟打一行日志 —— 不崩、不报警、
+    // 只是**配的图片模型悄悄不生效**（2026-08-04 dev 上实测到的就是这一条）。
+    imageModelSelection: {
+      fetchImageModelSelection: async () => {
+        const cached = modelConfigStore.getCached();
+        return { imageProvider: cached.imageProvider, imageModel: cached.imageModel };
+      },
+    } satisfies ImageModelSelectionSource,
+    // 账号平台窄读（`accounts` 是本域属主表）。属主缺这个方法就**不注册**，
+    // 绝不注册一条注定 500 的路由 —— 与单体同口径。
+    accountPlatform: accountStore.getPlatformOrNull
+      ? ({
+          getPlatformOrNull: (accountId: string) => accountStore.getPlatformOrNull!(accountId),
+        } satisfies AccountPlatformReader)
+      : undefined,
+    // 候审卡该不该发的判定：要的两张表（分组稿件策略 / 客户审批归属）都是本域属主，
+    // 故判定留本进程，内容进程只问结论。**每一条失败路径都回「保留飞书卡」**：
+    // 判不出来时少发一张卡 = 稿件从此没人审，而多发一张只是噪音。
+    reviewCardDelivery: {
+      resolveReviewCardDelivery: async (accountId: string) => {
+        let policy: Awaited<
+          ReturnType<ApprovalPolicyStore['getGroupPublishPolicyForAccount']>
+        >;
+        try {
+          policy = await approvalPolicy.getGroupPublishPolicyForAccount(accountId);
+        } catch (error) {
+          console.warn(
+            `[approval-policy] 分组稿件策略读取失败，保留飞书卡 account=${accountId}: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+          return { send: true, reason: 'policy_read_failed' };
+        }
+        if (policy.delivery !== 'client_only') return { send: true, reason: 'client_and_feishu' };
+        if (!policy.groupLabel) return { send: true, reason: 'account_group_missing' };
+        try {
+          const reachability =
+            await clientUserStore.hasEnabledClientApprovalReachability(accountId);
+          if (reachability.reachable) {
+            return { send: false, reason: 'suppressed_by_client_only_policy' };
+          }
+          console.warn(
+            `[approval-policy] client_only 账号客户审批归属不可证，保留飞书卡 account=${accountId}`
+              + ` group=${policy.groupLabel} reason=${reachability.reason}`,
+          );
+          return { send: true, reason: `client_reachability_${reachability.reason}` };
+        } catch (error) {
+          console.warn(
+            `[approval-policy] 客户审批归属读取失败，保留飞书卡 account=${accountId}: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+          return { send: true, reason: 'client_reachability_read_failed' };
+        }
+      },
+    } satisfies ReviewCardDeliveryPort,
+    /** 发布台账窄写口：`publish_log` 是本域属主表，内容进程经这四条写。 */
+    publishLogWriter: publishLogStore as PublishLogWriter,
+    /** 发布管线角色执行日志：`publish_pipeline_logs` 同属本域。 */
+    pipelineLogSink: publishPipelineLogStore as PipelineLogSink,
   };
 
   const pairedCommands = {
@@ -1869,6 +1988,8 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
       panelEvidence: syncReadPanelEvidence,
     },
     contentReads,
+    contentPublishCardExit: apiFeishu.publishCardExit,
+    configMirrorBumpSink,
     business: {
       startIngress: startBusinessIngress,
     },
@@ -1916,7 +2037,27 @@ function registerApiAuthorityRoutes(
   // **无条件注册**、绝不加 `if`：这两条的事实源是本域属主表，缺席不是「本进程没配」而是接线漏了。
   registerRoleModelSelectionRoutes(server, root.contentReads.roleModelSelectionSource);
   registerProviderSecretRoutes(server, root.contentReads.providerSecretReader);
+  // 同一类漏注册的**另外六族**（2026-08-04 实测：内容进程每分钟打一次
+  // 「取图片模型失败，沿用保守默认」—— 配的图片模型悄悄不生效，不崩、不报警）。
+  // 全部无条件注册、全部不带令牌，与内容进程那侧的客户端一一对应；
+  // 唯一带令牌的是写审批信号那一条，它在下面那族里单独走 bearer。
+  registerReviewCardDeliveryRoutes(server, root.contentReads.reviewCardDelivery);
+  registerPublishLogRoutes(server, root.contentReads.publishLogWriter);
+  registerPipelineLogRoutes(server, root.contentReads.pipelineLogSink);
+  registerImageModelSelectionRoutes(server, root.contentReads.imageModelSelection);
+  // 账号平台窄读：**属主缺这个方法就不注册**，绝不注册一条注定 500 的路由。
+  // 与上面几条不同，这里的守卫不是形式主义——账号存储是可打桩的，桩上没有这个方法。
+  if (root.contentReads.accountPlatform) {
+    registerAccountPlatformRoutes(server, root.contentReads.accountPlatform);
+  } else {
+    console.warn(
+      '[aidcp-api] 账号平台读路由未注册（账号存储没有该方法）'
+        + ' —— 内容进程的账号平台判定会失败，那不是「这个账号没有平台」',
+    );
+  }
   const publishApprovalToken = requiredEnv('AIDCP_PUBLISH_APPROVAL_INTERNAL_TOKEN');
+  registerPublishCardExitRoutes(server, root.contentPublishCardExit, publishApprovalToken);
+  registerConfigMirrorBumpRoutes(server, root.configMirrorBumpSink);
   registerPublishApprovalAuthorityRoutes(
     server,
     root.publishApproval.authority,
@@ -2225,10 +2366,24 @@ export async function startApiService(options: {
     throw error;
   }
   // 能力清单：注册了什么与没注册什么由**同一个数组**得出（见 formatApiCapabilityRoster）。
+  // ⚠️ 这张清单是**人工维护**的，它不是从「实际注册了什么」推出来的。
+  // 2026-08-04 实测过它撒谎的样子：七族路由一条都没注册，而这里照样打「未注册=无」。
+  // 真正防漏的是路由清单闸（test/acceptance/served-route-inventory.test.ts，两个方向都锁）；
+  // 本清单只负责把结论说给运行期的人听，**新增一族路由 MUST 同时在这里加一行**。
   const capabilities: ApiStartupCapability[] = [
     { name: 'api-owner-authorities', registered: true },
     { name: 'publish-approval-authorities', registered: true },
     { name: 'sync-read(snapshot/changed/readiness)', registered: true },
+    { name: 'content-reads(role-model/provider-secret/image-model)', registered: true },
+    { name: 'content-ports(review-card/publish-log/pipeline-log/publish-card-exit)', registered: true },
+    { name: 'config-mirror-bump(落地端；生产方尚未接线)', registered: true },
+    root.contentReads.accountPlatform
+      ? { name: 'account-platform', registered: true }
+      : {
+          name: 'account-platform',
+          registered: false,
+          reason: '账号存储没有该方法 ⇒ 内容进程的账号平台判定会失败',
+        },
     root.contentScheduler.scheduler === null
       ? {
           name: 'content-scheduling',
