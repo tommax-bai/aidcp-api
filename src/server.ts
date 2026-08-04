@@ -1191,9 +1191,25 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
   const contentToken = requiredEnv('AIDCP_CONTENT_INTERNAL_TOKEN');
   const publishApprovalToken = requiredEnv('AIDCP_PUBLISH_APPROVAL_INTERNAL_TOKEN');
 
+  /**
+   * 本域配置镜像版本表的写口。**构造得比所有属主存储都早，因为它们全都要接它。**
+   *
+   * 接不接它是本进程里**代价最不对称**的一格：接了，没有写发生时它一次也不动；
+   * 不接，`writeWithMirrorBump` 那句 `if (!bumper) return run(pool)` 会让写照常提交、
+   * 版本一动不动、**不报错也不告警**。后果有两层，且第二层曾把 dev 拖到起不来：
+   *   ① 消费方的镜像永远不刷新 —— 新账号 / 新人设对自动化进程从此不存在；
+   *   ② 同一个游标上发出了两种载荷摘要 ⇒ 消费方**永久**拒收 ⇒ 自动化重启即
+   *      `same_cursor_payload_drift`、业务入口不放行、8787 消失（2026-08-04 实测）。
+   * 「本进程今天只读这张表」不是不接它的理由：读写归属会变，而变的那天没有任何东西会提醒人。
+   * 覆盖面由 `test/acceptance/mirror-bump-wiring.test.ts` 按事实源核，不靠这段注释。
+   */
+  const mirrorVersionStore = new MirrorVersionStore({ pool });
   const accountStore = new PgAccountStore({
     pool,
     schemaEnsurer: migrationManagedSchema,
+    // `accounts` 是同步读流 `automation_account_projection` 的载荷来源；
+    // 本进程经内部 HTTP 对外提供 ensureAccount / setPaused / 昵称 / 分组四个写口。
+    mirrorVersionBumper: mirrorVersionStore,
   });
   const publishLogStore = new PublishLogStore({
     pool,
@@ -1211,20 +1227,13 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
    * **不调 versionStore.init()**：那是一条 `CREATE TABLE IF NOT EXISTS` 的运行期建表路径，
    * 而本仓的 schema 只由迁移管（0062 / 0076 已建两张表）。
    *
-   * ⚠️ **生产方那一侧今天还没接线**：自动化进程既没建失效信号的中继、
-   * 四个限频配置存储也都没传版本推进器 ⇒ 这条通道两端里只有本端就位。
+   * ⚠️ **原注释说「自动化那四个限频配置存储都没传版本推进器」——那是过期说法，2026-08-04 实核**：
+   * 会话 / 配额 / 节奏 / 恢复四个存储都已接上自动化侧的 outbox 型推进器。仍缺的是**中继**
+   * （把落库的失效信号异步推给本端）。**别把过期的「拿不到」当结论转抄下去**：
+   * 这类句子会被一片片转录、越写越确定，最后没人再去看事实源。
    * 照样注册路由，理由与面板事件入口那条相同：先让「对面接得住」成立，
    * 免得接生产方那天才发现路由根本不存在。缺的另一半已具名登记，MUST NOT 读成「补完这里就通了」。
    */
-  /**
-   * 本域配置镜像版本表的写口。
-   *
-   * **本进程有真实写口，所以必须接它**：客户端建环境那条链路就活在本进程里，它一笔事务
-   * 往 Facebook 运营策略与主浏览面两张表各插一行 —— 那正是同步读那条流的载荷来源。
-   * 不推版本的后果不是「配置晚点生效」，而是同一个游标发出两种载荷摘要、消费方永久拒收：
-   * 2026-08-04 dev 实测，一个客户端建了个新 Facebook 环境之后，单体重启**直接启动失败**。
-   */
-  const mirrorVersionStore = new MirrorVersionStore({ pool });
   const configMirrorBumpSink: ConfigMirrorBumpSink = new PgConfigMirrorBumpSink({
     pool,
     versionStore: mirrorVersionStore,
@@ -1264,6 +1273,7 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
   const contentSchedule = new ContentScheduleStore({
     pool,
     schemaEnsurer: migrationManagedSchema,
+    mirrorVersionBumper: mirrorVersionStore,
     scheduledAutomationCatalog: SCHEDULED_AUTOMATION_CATALOG_READER,
     globalActiveWeekMask: () => {
       const mask = syncReadMirrorsRef?.weekActiveMask();
@@ -1280,10 +1290,15 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
   const facebookCommentConfig = new FacebookCommentConfigStore({
     pool,
     schemaEnsurer: migrationManagedSchema,
+    mirrorVersionBumper: mirrorVersionStore,
   });
   const personaStore = new PersonaStore({
     pool,
     schemaEnsurer: migrationManagedSchema,
+    // 人设写口在本进程里**不是**直接调这个存储，而是经人设面板 / 自助建号补齐那条链
+    // （`persona-selected-fill:*` 就是它写下的 updated_by）。按变量名找调用点会漏掉它 ——
+    // 2026-08-04 那次 dev 卡死的两条流之一正是这里：12 条人设写进去了，版本一次没动。
+    mirrorVersionBumper: mirrorVersionStore,
   });
   /**
    * Facebook 运营基线（change split-cloud-automation-production-runtime 批 E-2 步骤 2）。
@@ -1319,6 +1334,7 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
   const facebookGroupJoinAutomation = new FacebookGroupJoinAutomationStore({
     pool,
     schemaEnsurer: migrationManagedSchema,
+    mirrorVersionBumper: mirrorVersionStore,
   });
   const replyScopes = new ReplyConfigScopeStore({ pool });
   const publishApprovalStore = new PublishApprovalStore({
@@ -1329,11 +1345,25 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
   // 全是本域属主表；构造它们**不是**为了本进程自己用，而是为了把两条窄口喂给 content 进程
   // ——单体在 startContentReadApi 里注册这两条 route，本手写 main 一直漏注册，
   // 结果 content 侧的库内密钥读必失败、且被调用点吞成「本来就没配」（见 contentReads 那一段）。
-  // **不传 mirrorVersionBumper**：本进程只读这三张表、不经它们写；缺省语义即「不推版本」。
-  // 将来若把面板配置写口也搬进本 main，MUST 同时补上 bumper，否则跨进程失效通道会静默断掉。
-  const modelConfigStore = new ModelConfigStore({ pool, schemaEnsurer: migrationManagedSchema });
-  const roleConfigStore = new RoleConfigStore({ pool, schemaEnsurer: migrationManagedSchema });
-  const categoryConfigStore = new CategoryConfigStore({ pool, schemaEnsurer: migrationManagedSchema });
+  // **三个都接 bumper**。原注释写的是「本进程只读这三张表，缺省语义即不推版本」——
+  // 那句话把一条**静默的**缺省当成了一个决定。这三张表的写口就在管理后台的模型配置页上，
+  // 而管理后台的后端跑在本进程；「今天只读」既不牢靠，也没有任何东西会在它不成立那天提醒人。
+  // 接上它在没有写发生时一次也不动，代价为零；不接的代价见 mirrorVersionStore 那段注释。
+  const modelConfigStore = new ModelConfigStore({
+    pool,
+    schemaEnsurer: migrationManagedSchema,
+    mirrorVersionBumper: mirrorVersionStore,
+  });
+  const roleConfigStore = new RoleConfigStore({
+    pool,
+    schemaEnsurer: migrationManagedSchema,
+    mirrorVersionBumper: mirrorVersionStore,
+  });
+  const categoryConfigStore = new CategoryConfigStore({
+    pool,
+    schemaEnsurer: migrationManagedSchema,
+    mirrorVersionBumper: mirrorVersionStore,
+  });
   const credentialStore = new CredentialStore({ pool, schemaEnsurer: migrationManagedSchema });
 
   await Promise.all([
