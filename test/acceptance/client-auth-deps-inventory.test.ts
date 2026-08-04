@@ -55,11 +55,6 @@ const ASSEMBLY_FILE = join(HERE, '..', '..', 'src', 'server.ts');
 const DELIBERATELY_ABSENT: Readonly<Record<string, string>> = {
   draftRefinements:
     'NEW_CHANNEL：草稿精修属 content 域，transport 里无现成通道。切流前已知（handoff §3.1 第 3 点）。',
-  interactionApi:
-    'NEW_CHANNEL：类本体在本仓，但 5 个构造依赖里 workflow（3 方法）与 sender（5 方法，其中 2 个'
-    + ' 同步返回 string、跨 HTTP 后签名要改成 Promise）在 transport 里零通道；另有一条已写好的'
-    + ' reader 通道在 automation 侧从未 register（客户端建得出来、对面 404）。'
-    + ' 注意这项缺席时客户端拿到的是 **404 整片路由消失**，不是 503。',
 };
 
 /** 抠出 `export interface ClientAuthDeps { … }` 的**顶层**字段名。 */

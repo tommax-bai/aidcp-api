@@ -183,6 +183,16 @@ import type { PublishApprovalPreflightResult } from './feishu/ws-receiver.js';
 import { PgInteractionAuthGate } from './interactions/interaction-auth-gate.js';
 import { PgInteractionApiWrites } from './interactions/interaction-api-writes.js';
 import { ReplyConfigResolver } from './interactions/reply-config-resolver.js';
+import {
+  InteractionCustomerApi,
+  interactionTestDataResetEnabled,
+} from './interactions/interaction-customer-api.js';
+import { InteractionStoreReaderHttpClient } from 'aidcp-transport/transport/interaction-store-reader-http.js';
+import {
+  InteractionRuntimeControlsHttpClient,
+  InteractionSendHttpClient,
+  InteractionWorkflowHttpClient,
+} from 'aidcp-transport/transport/interaction-automation-http.js';
 import { ReplyConfigScopeStore } from './interactions/reply-config-scope-store.js';
 import { FirstPostOnboardingStore } from './onboarding/first-post-onboarding-store.js';
 import type { PanelDeps, PanelHandle } from './panel/types.js';
@@ -2126,8 +2136,54 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
     sessionLimits: new PanelSessionLimitsHttpClient(automationHttp),
     resumeConfig: new PanelResumeConfigHttpClient(automationHttp),
   };
+  // ── 客户端收件箱（change deploy-derived-services-to-dev）────────────────────────
+  //
+  // 五个依赖里三个在自动化进程（存储读侧 / 回复工作流 / 发送编排），两个在本进程
+  // （客户账号、回复策略解析）。**构造式是全或无**：缺一个就整块不装，
+  // 客户端看到的不是 503 而是整片路由 404。
+  //
+  // ⚠ **工作流那三个方法各会跑一次模型调用**（分类 + 生成 + 风险复核，最坏可到分钟级），
+  // 而内部 HTTP 的默认单次超时是 15 秒 ⇒ 用默认连接必然超时，**而属主侧会照常把任务
+  // 推进到下一个状态** —— 那是「看起来失败其实成功」，比失败难查得多。所以工作流单独
+  // 拿一条放宽了超时的连接；其余两族仍用默认那条（它们都是快操作，放宽只会让一次真故障
+  // 拖更久才现形）。默认 90s：最坏路径是三次 20s 的模型调用串起来，留一点余量。
+  const interactionWorkflowHttp = new InternalHttpClient(
+    requiredUrl('AIDCP_AUTOMATION_URL'),
+    { timeoutMs: Number(process.env.AIDCP_INTERACTION_WORKFLOW_TIMEOUT_MS ?? 90_000) },
+  );
+  const interactionCursorSecret = process.env.AIDCP_CLIENT_JWT_SECRET ?? '';
+  const interactionRuntimeControlsDelivery =
+    new InteractionRuntimeControlsHttpClient(automationHttp);
+  const interactionCustomerApi = interactionCursorSecret
+    ? new InteractionCustomerApi({
+      users: clientUserStore,
+      store: new InteractionStoreReaderHttpClient(automationHttp),
+      configs: new ReplyConfigResolver(replyScopes),
+      workflow: new InteractionWorkflowHttpClient(interactionWorkflowHttp),
+      sender: new InteractionSendHttpClient(automationHttp),
+      // 开关改完立刻下发，别等边缘下次重连。快照由属主进程就地取（只递账号与版本）。
+      onRuntimeControlsUpdated: (controls) =>
+        interactionRuntimeControlsDelivery.deliverRuntimeControls({
+          accountId: controls.accountId,
+          version: controls.version,
+        }),
+      testDataResetEnabled: interactionTestDataResetEnabled(process.env),
+      cursorSecret: interactionCursorSecret,
+    })
+    : undefined;
+  if (!interactionCustomerApi) {
+    // 具名说出来。缺这一个的现形方式是**整片路由 404**，而 404 会被读成「这个功能不存在」。
+    console.warn(
+      '[aidcp-api] 客户端收件箱未装配（AIDCP_CLIENT_JWT_SECRET 未设）'
+        + ' —— 收件箱那一整片路由会 404，那不是「没有互动数据」',
+    );
+  }
   const clientAuthDeps: ClientAuthDeps = {
     store: clientUserStore,
+    // **直写这一格、不要条件展开**：依赖清单闸认的是这份对象字面量的顶层键，
+    // 展开写法会让「已装配」在闸眼里消失，于是它照旧要求一条缺席声明——而缺席声明与事实不符
+    // 正是那张表烂掉的方式。装不出来时这里是 undefined，那与「没装」在契约上同义。
+    interactionApi: interactionCustomerApi,
     // **客户侧的撤销表与面板那份各是各的**：共用一张表等于把两个信任域并成一个。
     revocation: new TokenRevocationStore(),
     rateLimiter: new LoginRateLimiter(),
