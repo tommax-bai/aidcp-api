@@ -193,6 +193,11 @@ import {
   InteractionSendHttpClient,
   InteractionWorkflowHttpClient,
 } from 'aidcp-transport/transport/interaction-automation-http.js';
+import {
+  DraftRefinementQueueHttpClient,
+  registerDraftRefinementDraftsRoutes,
+  type DraftRefinementDraftsWriter,
+} from 'aidcp-transport/transport/draft-refinement-http.js';
 import { ReplyConfigScopeStore } from './interactions/reply-config-scope-store.js';
 import { FirstPostOnboardingStore } from './onboarding/first-post-onboarding-store.js';
 import type { PanelDeps, PanelHandle } from './panel/types.js';
@@ -342,6 +347,11 @@ interface ApiDirectAuthorities {
   automationConfigCommands: AutomationConfigCommandsPort;
   offboardAdmissionLedger: OffboardAdmissionLedgerPort;
   notificationDelivery: StructuredNotificationDeliveryPort;
+  /**
+   * 稿件精修 worker 的落稿写口。worker 跑在内容进程，而 `publish_log` 属本域。
+   * 另一半 `loadForDispatch` 由 {@link ApiDirectAuthorities.publishLog} 那族既有路由承担。
+   */
+  draftRefinementDrafts: DraftRefinementDraftsWriter;
 }
 
 export interface ApiSyncReadRefreshReport {
@@ -1920,6 +1930,31 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
       },
     ),
     notificationDelivery: apiFeishu.notificationDelivery,
+    // 稿件精修落稿写口。**预览重推绑在这次写上、不由内容进程那边的 worker 触发** ——
+    // 与本仓既有的 `editDraft` 包装同一个形态（见 createApiPublishLogAuthority）：
+    // 「每次属主写成功产出一份单向预览」是本进程的不变量，客户端删配图那处的
+    // `refreshPreview: () => {}` 就是这条不变量的另一半。
+    //
+    // 单体是在 worker 里、且在作业状态置完成**之后**才推预览的；那个顺序留了一个洞：
+    // 稿子已经改了、而置完成失败时预览不推 —— 桌面端继续显示旧稿，用户以为没保存上。
+    // 绑在写上没有这个洞。
+    draftRefinementDrafts: {
+      refineDraft: async (recordId, accountId, expectedVersion, scope, selection, patch, editor) => {
+        const result = await publishLogStore.refineDraft(
+          recordId, accountId, expectedVersion, scope, selection, patch, editor,
+        );
+        if (result.ok) {
+          void publishUi.pushPreview(recordId).catch((error) => {
+            console.warn(
+              `[aidcp-api] refinement committed; UI preview delivery failed record=${recordId}: ${
+                error instanceof Error ? error.message : String(error)
+              }`,
+            );
+          });
+        }
+        return result;
+      },
+    },
   };
 
   /**
@@ -2191,6 +2226,11 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
       publishLogStore.countReferenceDraftsForAccount(accountId),
     pendingDrafts: publishLogStore,
     publishSchedule: publishLogStore,
+    // 稿件精修队列。表属内容域，本进程经内部 HTTP 问它。**同样直写这一格**：
+    // 条件展开会让依赖清单闸看不见它。三条客户端路由里有一条（待审稿列表顺带挂的
+    // 「上次精修状态」）在缺席时是**不报错**的——它只会让每条稿子看起来从没被精修过，
+    // 没有人会为此报障。
+    draftRefinements: new DraftRefinementQueueHttpClient(contentHttp, contentToken, target),
     facebookOperationPolicy,
     commentApprovalPolicy: {
       getForOwnedEnv: (userId, envKey) =>
@@ -2532,6 +2572,7 @@ function registerApiAuthorityRoutes(
   registerAutomationConfigCommandsRoutes(server, port.automationConfigCommands, token, target);
   registerOffboardAdmissionLedgerRoutes(server, port.offboardAdmissionLedger, token, target);
   registerStructuredNotificationRoutes(server, port.notificationDelivery, token, target);
+  registerDraftRefinementDraftsRoutes(server, port.draftRefinementDrafts, token, target);
   // content 侧的两条窄读（change split-cloud-automation-production-runtime，A-3）：
   // 单体在 startContentReadApi 里注册这两条，本 main 此前漏了 ⇒ content 读库内密钥必失败。
   // **无条件注册**、绝不加 `if`：这两条的事实源是本域属主表，缺席不是「本进程没配」而是接线漏了。

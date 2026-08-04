@@ -48,6 +48,10 @@ const SERVED_FAMILIES: readonly string[] = [
   'registerAutomationConfigCommandsRoutes',
   'registerOffboardAdmissionLedgerRoutes',
   'registerStructuredNotificationRoutes',
+  // 稿件精修 worker（跑在内容进程）的落稿写口。**这一族只有一条方法**——
+  // 同端口的 loadForDispatch 复用 registerAutomationPublishLogRoutes 那族既有路由，
+  // 不另挂一条同语义的（两条同义路由只会各自演化）。
+  'registerDraftRefinementDraftsRoutes',
   'registerScheduleFeedbackRoutes',
   // 发布审批
   'registerPublishApprovalAuthorityRoutes',

@@ -51,11 +51,13 @@ const ASSEMBLY_FILE = join(HERE, '..', '..', 'src', 'server.ts');
  *
  * ⚠ **在这张表里 ≠ 用户看到的是好的**：每一条对应客户端上一个答 503 的功能。
  * 这张表的作用是让「答 503」成为一个**有人签过字的决定**，而不是一次没人知道的遗漏。
+ *
+ * 2026-08-04 起这张表**是空的**：契约里每个依赖都真的装配了（最后一条 `draftRefinements`
+ * 随双向通道 `transport/draft-refinement-http.ts` 接上）。空表不等于本闸退休 ——
+ * 它现在守的是「不许再悄悄空一格」：往 `ClientAuthDeps` 加字段而组装根没填，
+ * AC-CADEPS-01 当场红，逼人在这里写清楚为什么那条功能要在客户端上答 503。
  */
-const DELIBERATELY_ABSENT: Readonly<Record<string, string>> = {
-  draftRefinements:
-    'NEW_CHANNEL：草稿精修属 content 域，transport 里无现成通道。切流前已知（handoff §3.1 第 3 点）。',
-};
+const DELIBERATELY_ABSENT: Readonly<Record<string, string>> = {};
 
 /** 抠出 `export interface ClientAuthDeps { … }` 的**顶层**字段名。 */
 function contractFields(source: string): string[] {
