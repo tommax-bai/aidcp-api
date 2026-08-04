@@ -63,3 +63,22 @@ test('全部就位时「未注册」明确答「无」，MUST NOT 留空让人�
   const text = formatApiCapabilityRoster([{ name: 'api-owner-authorities', registered: true }]);
   assert.match(text, /未注册=无/);
 });
+
+/**
+ * 面板 API 与客户鉴权 API **必须有调用点**。
+ *
+ * 这条钉的是一次真事故形态：两块的实现随属主搬进了本仓，手写的 main() 却从头到尾没调用它们。
+ * 本仓的编译期与测试对此**完全无感**——代码在、没人调，和「调了但对面 404」一样安静；
+ * 只有单体停掉那一刻才会发现管理后台整个打不开、桌面客户端登不上。
+ */
+test('面板与客户鉴权都在组装根里有真调用点', async () => {
+  const source = await readFile(new URL('../../src/server.ts', import.meta.url), 'utf8');
+  for (const starter of ['startPanelApi(', 'startClientAuthApi(']) {
+    const calls = source.split(starter).length - 1;
+    assert.ok(
+      calls >= 1,
+      `组装根里找不到 ${starter} 的调用点——这两块只要没人调，本仓一切照绿，`
+        + '而单体一停 console 与客户端登录同时消失。',
+    );
+  }
+});

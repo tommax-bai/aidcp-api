@@ -156,7 +156,31 @@ import { PgInteractionApiWrites } from './interactions/interaction-api-writes.js
 import { ReplyConfigResolver } from './interactions/reply-config-resolver.js';
 import { ReplyConfigScopeStore } from './interactions/reply-config-scope-store.js';
 import { FirstPostOnboardingStore } from './onboarding/first-post-onboarding-store.js';
-import type { PanelDeps } from './panel/types.js';
+import type { PanelDeps, PanelHandle } from './panel/types.js';
+import { startPanelApi } from './panel/panel-server.js';
+import { PgPanelStore } from './panel/panel-store.js';
+import { parsePanelUsers } from './panel/auth.js';
+import { PanelEventFanout } from './panel/panel-event-fanout.js';
+import { TokenRevocationStore } from './panel/revocation.js';
+import {
+  startClientAuthApi,
+  type ClientAuthDeps,
+  type ClientAuthHandle,
+} from './client-auth/client-auth-server.js';
+import { LoginRateLimiter } from './client-auth/rate-limiter.js';
+import { PanelAutomationHttpClient } from 'aidcp-transport/transport/panel-automation-http.js';
+import { PublishStatusHttpClient } from 'aidcp-transport/transport/publish-status-http.js';
+import { RiskCommandHttpClient } from 'aidcp-transport/transport/risk-command-http.js';
+import { RiskReadHttpClient } from 'aidcp-transport/transport/risk-read-http.js';
+import { GroupRouteHttpClient } from 'aidcp-transport/transport/group-route-http.js';
+import { AlertResolutionHttpClient } from 'aidcp-transport/transport/alert-resolution-http.js';
+import {
+  PanelQuotaConfigHttpClient,
+  PanelPacingConfigHttpClient,
+  PanelSessionLimitsHttpClient,
+  PanelResumeConfigHttpClient,
+} from 'aidcp-transport/transport/panel-config-http.js';
+import { registerPanelEventDeliveryRoutes } from 'aidcp-transport/transport/panel-event-delivery-http.js';
 import { createClientPublishApprovalHandler } from './publish-agent/client-publish-approval.js';
 import { createPublishDraftImageRemoveHandler } from './publish-agent/draft-image-remove.js';
 import {
@@ -606,6 +630,29 @@ interface ApiCompositionRoot {
    * 拆开之前它没有任何进程在跑；本进程是它按分工该在的地方。
    */
   contentScheduler: ApiContentSchedulerRuntime;
+  /**
+   * 面板 API（管理后台后端）。`port` 为 null 即不启用——沿用单体的门控语义。
+   * `eventFanout` 同时是面板事件的**入口**（automation 经内部 HTTP 推进来）与**出口**（面板 ws 订阅）。
+   */
+  panel: { deps: PanelDeps; eventFanout: PanelEventFanout; port: number | null };
+  /** 客户鉴权 API（桌面客户端登录 / 取环境）。`port` 为 null 即不启用。 */
+  clientAuth: { deps: ClientAuthDeps; port: number | null };
+}
+
+/**
+ * 可选端口：**没配就是没配**，绝不给默认值。
+ *
+ * 猜一个默认端口的两种结局都不好：猜中了会跟单体抢同一个端口（谁先起谁赢，另一个静默失败），
+ * 猜不中则是一个没有任何人访问的监听口，而它看起来跟「工作正常」一模一样。
+ */
+function readOptionalPort(name: string): number | null {
+  const raw = process.env[name]?.trim();
+  if (!raw) return null;
+  const port = Number(raw);
+  if (!Number.isInteger(port) || port < 1 || port > 65_535) {
+    throw new Error(`${name} must be an integer in 1..65535`);
+  }
+  return port;
 }
 
 function requiredEnv(name: string): string {
@@ -1655,6 +1702,136 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
     logger: console,
   });
 
+  // ══ 面板 API 与客户鉴权 API（change deploy-derived-services-to-dev）══════════════════
+  //
+  // 这两块此前**在本仓一次都没被调用过**：`startPanelApi` / `startClientAuthApi` 的实现随属主
+  // 搬进了本仓，手写的 main() 却从头到尾没有它们的调用点。后果不是「少两个接口」——
+  // 单体一停，管理后台整个打不开、桌面客户端登不上，而这两件事在本仓的编译期与测试里
+  // 完全看不出来（代码在、没人调，跟「调了但对面 404」一样安静）。
+  //
+  // 端口沿用单体的门控语义：**未设端口即不启用**（MUST NOT 猜一个默认端口——猜中了会跟单体抢，
+  // 猜不中则是一个没人访问的监听口）。
+  const panelEventFanout = new PanelEventFanout();
+  const syncReadPanelEvidence = createApiSyncReadPanelEvidencePorts(syncReadMirrors);
+  const panelDeps: PanelDeps = {
+    publishLogStore,
+    botChatStore: apiFeishu.botChatStore,
+    eventBus: panelEventFanout,
+    // 本进程**没有**边缘登记表——边-云服务端在自动化进程里。在线数走同步读镜像
+    // （`edgePresenceEvidence`，下一行），面板注入了镜像就不会调这两个方法。
+    // 真被调到时**响亮抛错**：返回 0 会被读成「一台边缘都没在线」，那是编出来的事实。
+    edgeServer: {
+      edgeCount: () => {
+        throw new Error(
+          'edge_registry_not_in_api_process: 边缘登记表在自动化进程，本进程没有立场答这个数',
+        );
+      },
+      onlineEdgeCount: () => {
+        throw new Error(
+          'edge_registry_not_in_api_process: 在线边缘数走 edgePresenceEvidence 镜像，不走本地权威',
+        );
+      },
+    },
+    // 三个同步读镜像口整体展开：**别在这里重新包一层**——包一层就得自己处理「口不存在」，
+    // 而那正是把「镜像没就绪」悄悄变成「答 0」的入口。
+    ...syncReadPanelEvidence,
+    panelStore: new PgPanelStore({ pool, automation: new PanelAutomationHttpClient(automationHttp) }),
+    publishStatus: new PublishStatusHttpClient(contentHttp),
+    riskCommands: new RiskCommandHttpClient(automationHttp, { executionTarget: target }),
+    riskRead: new RiskReadHttpClient(automationHttp),
+    writeApprovalSignal: (requestId, approved, payload, decidedBy) =>
+      writeApprovalDecision(requestId, approved, payload, { decidedBy, decidedVia: 'console' }),
+    readApprovalDispatchStates: (requestIds) => publishApprovalStore.readActiveMany(requestIds),
+    commandActions: commandFace.panelCommandActions,
+    revocation: new TokenRevocationStore(),
+    delegatedTasks,
+    accountAttr: {
+      setGroupLabel: (accountId, groupLabel) => accountStore.setGroupLabel(accountId, groupLabel),
+      setContactInfo: (accountId, contactInfo) =>
+        accountStore.setContactInfo(accountId, contactInfo),
+    },
+    facebookCommentConfig: {
+      get: (accountId) => facebookCommentConfig.getForAccount(accountId),
+      set: (accountId, patch, updatedBy) =>
+        facebookCommentConfig.setAccount(accountId, patch, updatedBy),
+    },
+    facebookOperationPolicy,
+    facebookGroupTargets: panelFacebookGroupTargets,
+    contentSchedule: {
+      getGlobalView: () => {
+        const global = contentSchedule.getGlobal();
+        return {
+          contentActiveMask: global?.contentActiveMask ?? null,
+          overridden: global !== null,
+          updatedAt: global?.updatedAt ?? null,
+          updatedBy: global?.updatedBy ?? null,
+        };
+      },
+      listCatalog: () => contentSchedule.listCatalog(),
+      setGlobal: (mask, updatedBy) =>
+        contentSchedule.setGlobal({ contentActiveMask: mask }, updatedBy),
+      setAccount: (accountId, patch, updatedBy) =>
+        contentSchedule.setAccount(accountId, patch, updatedBy),
+      // `setJoinGroupAutomation` **有意不接**（它是可选口）：单体那份写完加群配置之后还要拼一张
+      // 目录视图，而那张视图要读风控日配额与群目标范围——两样都在自动化域，且后者今天对面
+      // 根本没注册那族路由。接一个「读不到就填 0」的版本，会让运营在后台看到一个编出来的上限。
+      // 缺席时面板逐路由答「未提供」，那是**答案**；填 0 是谎。已登记 backlog。
+    },
+    persona: personaPanel,
+    notificationContact: notificationContacts,
+    approvalPolicies: {
+      list: async () => {
+        const [accounts, groups, coverage] = await Promise.all([
+          approvalPolicy.listAccountPolicies(),
+          approvalPolicy.listGroupPolicies(),
+          clientUserStore.listClientApprovalCoverageByGroup(),
+        ]);
+        const coverageByGroup = new Map(coverage.map((row) => [row.groupLabel, row]));
+        return {
+          accounts,
+          groups: groups.map((row) => ({
+            ...row,
+            activeAccountCount: coverageByGroup.get(row.groupLabel)?.activeAccountCount ?? 0,
+            reachableAccountCount: coverageByGroup.get(row.groupLabel)?.reachableAccountCount ?? 0,
+          })),
+        };
+      },
+      listEnvironmentCommentPolicies: (envKeys) =>
+        approvalPolicy.listEnvironmentCommentPolicies(envKeys),
+      getEnvironmentCommentPolicy: (envKey) => approvalPolicy.getEnvironmentCommentPolicy(envKey),
+      setEnvironmentCommentMode: (envKey, mode, updatedBy) =>
+        approvalPolicy.setEnvironmentCommentMode(envKey, mode, updatedBy),
+      setGroupPublishDelivery: (groupLabel, delivery, updatedBy) =>
+        approvalPolicy.setGroupPublishDelivery(groupLabel, delivery, updatedBy),
+    },
+    clientUsers: clientUserStore,
+    slowStartDisabled: process.env.AIDCP_SLOW_START_DISABLED === 'true',
+    notificationRoutes: new GroupRouteHttpClient(automationHttp),
+    alertStore: new AlertResolutionHttpClient(automationHttp),
+    quotaConfig: new PanelQuotaConfigHttpClient(automationHttp),
+    pacingConfig: new PanelPacingConfigHttpClient(automationHttp),
+    sessionLimits: new PanelSessionLimitsHttpClient(automationHttp),
+    resumeConfig: new PanelResumeConfigHttpClient(automationHttp),
+  };
+  const clientAuthDeps: ClientAuthDeps = {
+    store: clientUserStore,
+    // **客户侧的撤销表与面板那份各是各的**：共用一张表等于把两个信任域并成一个。
+    revocation: new TokenRevocationStore(),
+    rateLimiter: new LoginRateLimiter(),
+    referenceDraftCountForAccount: (accountId) =>
+      publishLogStore.countReferenceDraftsForAccount(accountId),
+    pendingDrafts: publishLogStore,
+    publishSchedule: publishLogStore,
+    facebookOperationPolicy,
+    commentApprovalPolicy: {
+      getForOwnedEnv: (userId, envKey) =>
+        approvalPolicy.getOwnedEnvironmentCommentPolicy(userId, envKey),
+      setForOwnedEnv: (userId, envKey, mode, updatedBy) =>
+        approvalPolicy.setOwnedEnvironmentCommentMode(userId, envKey, mode, updatedBy),
+    },
+    delegatedTasks,
+  };
+
   return {
     target,
     pool,
@@ -1663,6 +1840,8 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
     contentScheduler,
     pairedCommands,
     panelFacebookGroupTargets,
+    panel: { deps: panelDeps, eventFanout: panelEventFanout, port: readOptionalPort('AIDCP_PANEL_PORT') },
+    clientAuth: { deps: clientAuthDeps, port: readOptionalPort('AIDCP_CLIENT_AUTH_PORT') },
     publishApproval: {
       authority: publishApprovalAuthority,
       decisionWriter: publishApprovalDecisionWriter,
@@ -1671,7 +1850,7 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
     syncRead: {
       ownerSource: syncReadOwnerSource,
       consumer: syncReadConsumer,
-      panelEvidence: createApiSyncReadPanelEvidencePorts(syncReadMirrors),
+      panelEvidence: syncReadPanelEvidence,
     },
     contentReads,
     business: {
@@ -1872,7 +2051,65 @@ export async function startApiService(options: {
     root,
     () => businessIngressStarted,
   );
+  // automation → api 的面板事件入口。**对面今天还没有推送方**（automation 侧未建客户端），
+  // 照样注册：先让「对面接得住」成立，别等写推送方那天才发现路由不存在——
+  // 那是本仓已经连撞多次的形态（客户端建得出来、调用编译得过、跑起来才 404）。
+  registerPanelEventDeliveryRoutes(server, root.panel.eventFanout, root.target);
   const port = await server.listen(apiPort());
+
+  // ── 面板 API 与客户鉴权 API ────────────────────────────────────────────────────
+  // 两者都在**内部口监听之后**起：它们是对外面（console / 桌面客户端）的口，
+  // 而内部口是本进程被其他服务调用的入口——先让被调面可达，外部口再上。
+  // 起不来**不拖垮本进程**（沿用单体语义），但 MUST 具名说清是哪一条、为什么。
+  let panelHandle: PanelHandle | null = null;
+  if (root.panel.port === null) {
+    console.warn('[aidcp-api] 面板 API 未启用（AIDCP_PANEL_PORT 未设）—— 管理后台将无后端');
+  } else {
+    panelHandle = await startPanelApi(root.panel.deps, {
+      port: root.panel.port,
+      jwtSecret: process.env.AIDCP_PANEL_JWT_SECRET ?? '',
+      users: parsePanelUsers(process.env.AIDCP_PANEL_USERS),
+      jwtTtlSeconds: Number(process.env.AIDCP_PANEL_JWT_TTL_SECONDS ?? 3600),
+      // 自检名单：本进程自己的内部口 + PG + 客户鉴权口。**两个对外口互相回避**，
+      // 撞上即拒绝绑定，而不是把另一条服务顶掉。
+      forbiddenPorts: [port, 5432, ...(root.clientAuth.port ? [root.clientAuth.port] : [])],
+      logger: console,
+    });
+    if (!panelHandle.started) {
+      console.error(
+        `[aidcp-api] 面板 API 启动失败（reason=${panelHandle.reason ?? 'unknown'}`
+          + `${panelHandle.detail ? `, detail=${panelHandle.detail}` : ''}）—— 管理后台将无后端`,
+      );
+    } else {
+      console.log(`[aidcp-api] 面板 API 已监听 127.0.0.1:${panelHandle.port}`);
+    }
+  }
+  let clientAuthHandle: ClientAuthHandle | null = null;
+  if (root.clientAuth.port === null) {
+    console.warn(
+      '[aidcp-api] 客户鉴权 API 未启用（AIDCP_CLIENT_AUTH_PORT 未设）—— 桌面客户端将无法登录',
+    );
+  } else {
+    clientAuthHandle = await startClientAuthApi(root.clientAuth.deps, {
+      port: root.clientAuth.port,
+      jwtSecret: process.env.AIDCP_CLIENT_JWT_SECRET ?? '',
+      // 只为那条「与面板密钥相同即拒启」的断言而传：密钥即边界，两边同一把等于边界坍塌。
+      panelJwtSecret: process.env.AIDCP_PANEL_JWT_SECRET ?? '',
+      jwtTtlSeconds: Number(process.env.AIDCP_CLIENT_JWT_TTL_SECONDS ?? 900),
+      forbiddenPorts: [port, 5432, ...(root.panel.port ? [root.panel.port] : [])],
+      logger: console,
+    });
+    if (!clientAuthHandle.started) {
+      console.error(
+        `[aidcp-api] 客户鉴权 API 启动失败（reason=${clientAuthHandle.reason ?? 'unknown'}`
+          + `${clientAuthHandle.detail ? `, detail=${clientAuthHandle.detail}` : ''}）`
+          + ' —— 桌面客户端将无法登录',
+      );
+    } else {
+      console.log(`[aidcp-api] 客户鉴权 API 已监听 127.0.0.1:${clientAuthHandle.port}`);
+    }
+  }
+
   let publishApprovalRelayTimer: NodeJS.Timeout | null = null;
   let closing = false;
   const pumpPublishApprovalOutbox = (): void => {
@@ -1929,6 +2166,9 @@ export async function startApiService(options: {
         clearInterval(publishApprovalRelayTimer);
         publishApprovalRelayTimer = null;
       }
+      // 两个对外口先关：关停期间它们还开着，就等于对 console / 客户端继续声称「我在服务」。
+      if (clientAuthHandle?.started) await clientAuthHandle.close().catch(() => undefined);
+      if (panelHandle?.started) await panelHandle.close().catch(() => undefined);
       await server.close();
       await root.pool.end();
     })();
