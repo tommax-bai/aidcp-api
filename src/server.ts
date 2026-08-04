@@ -129,6 +129,7 @@ import { registerPublishCardExitRoutes } from 'aidcp-transport/transport/publish
 import { registerImageModelSelectionRoutes } from 'aidcp-transport/transport/image-model-selection-http.js';
 import { registerAccountPlatformRoutes } from 'aidcp-transport/transport/account-platform-http.js';
 import { registerConfigMirrorBumpRoutes } from 'aidcp-transport/transport/config-mirror-bump-http.js';
+import { ClientEnvAutomationHttpClient } from 'aidcp-transport/transport/client-env-automation-http.js';
 import type { ReviewCardDeliveryPort } from 'aidcp-kernel/kernel/review-card-delivery-port.js';
 import type { PublishLogWriter } from 'aidcp-kernel/kernel/publish-log-writer-port.js';
 import type { PipelineLogSink } from 'aidcp-kernel/kernel/pipeline-log-contract.js';
@@ -1169,6 +1170,10 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
   const clientUserStore = new ClientUserStore({
     pool,
     mirrorVersionBumper: mirrorVersionStore,
+    // automation 属主表的只读投影：**本进程不该持有那个库的连接**，故走内部 HTTP。
+    // 不注入时那个端口是「当场抛」的形态 —— 表现不是某个字段为空，而是
+    // 管理后台的环境页整页 500（2026-08-04 切流当天实测）。
+    automationReads: new ClientEnvAutomationHttpClient(automationHttp),
     executionTarget: target,
     schemaEnsurer: migrationManagedSchema,
   });
