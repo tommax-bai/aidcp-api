@@ -197,6 +197,17 @@ import { RiskCommandHttpClient } from 'aidcp-transport/transport/risk-command-ht
 import { RiskReadHttpClient } from 'aidcp-transport/transport/risk-read-http.js';
 import { CuratedContentHttpClient } from 'aidcp-transport/transport/curated-content-http.js';
 import { projectClientEnvironmentSchedule } from './client-auth/client-environment-schedule.js';
+import { projectClientPublishQueue } from './client-auth/client-publish-queue.js';
+import type {
+  PublishApprovalActionPayload,
+  PublishApprovalActionResultPayload,
+  PublishDraftImageRemovePayload,
+  PublishDraftImageRemoveResultPayload,
+} from './api-contracts/publish-approval-wire.js';
+import {
+  buildPublishLifecycle,
+  type ApprovalDispatchProjection,
+} from './panel/publish-stage-lifecycle.js';
 import { GroupRouteHttpClient } from 'aidcp-transport/transport/group-route-http.js';
 import { AlertResolutionHttpClient } from 'aidcp-transport/transport/alert-resolution-http.js';
 import {
@@ -1017,6 +1028,25 @@ export function createApiPublishOwnerHandlers(
     StartApiFeishuIngressInput,
     'commandFace' | 'delegatedTasks'
   >;
+  /**
+   * 客户鉴权那条口要的**同一对 handler，但带 actor**。
+   *
+   * **为什么不复用 `edgePublish`**：那个端口的形状是给边缘发布命令用的，
+   * 它的 `decidePublishApproval` 只传 `(payload, accountId)`、**把 actor 丢掉**，
+   * 于是审批会落成默认署名。用在客户那条口上不会报错、审批也照样成功 ——
+   * 只是台账上认不出是哪个客户操作的，而那正是审批台账存在的理由。
+   */
+  clientPublishActions: {
+    decidePublishApproval: (
+      payload: PublishApprovalActionPayload,
+      accountId: string,
+      actor: string,
+    ) => Promise<PublishApprovalActionResultPayload>;
+    removeDraftImage: (
+      payload: PublishDraftImageRemovePayload,
+      session: { accountId: string; actor: string },
+    ) => Promise<PublishDraftImageRemoveResultPayload>;
+  };
 } {
   const logger = deps.logger ?? console;
   const readLiveContentVersion = async (recordId: number): Promise<number | null> => {
@@ -1107,6 +1137,8 @@ export function createApiPublishOwnerHandlers(
       decidePublishApproval: (input) =>
         decidePublishApproval(input.payload, input.accountId),
     },
+    // 同一对 handler，actor 不丢（见返回类型上的说明）。
+    clientPublishActions: { decidePublishApproval, removeDraftImage },
     feishuApprovalIngress: {
       writeApproval: (requestId, approved, payload, context) =>
         deps.writeApprovalDecision(requestId, approved, payload, context),
@@ -1554,6 +1586,7 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
     logger: console,
   });
   const edgePublish = publishOwnerHandlers.edgePublish;
+  const clientPublishActions = publishOwnerHandlers.clientPublishActions;
 
   const panelFacebookGroupTargets = createApiPanelFacebookGroupTargets(
     new FacebookGroupOpsHttpClient(automationHttp),
@@ -1910,6 +1943,44 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
   // 不是报错，而是某一侧把一个还在爬坡的新账号按满档跑。
   facebookOperationPolicy.bindSlowStartResolver(async (accountId) =>
     resolveFacebookSlowStartFromView(await riskRead.slowStartView(accountId)));
+  /**
+   * 稿件 id → 授权下发进度。位置与单体的同名函数一致（都在组装根里）。
+   *
+   * **`publish-<id>` 这个 requestId 形态是与发布审批那侧的耦合点**：改了那边的拼法，
+   * 这里的正则会一条都匹配不上，而表现不是报错、是下发态整片消失、前端回落既有呈现。
+   * 读失败同理只降级、不伪造 —— **MUST NOT 因为读不到就编一个「无阻塞」的下发态**。
+   */
+  const readApprovalDispatchProjection = async (
+    rows: Array<{ id: number }>,
+  ): Promise<Map<number, ApprovalDispatchProjection>> => {
+    const out = new Map<number, ApprovalDispatchProjection>();
+    const ids = [...new Set(rows.map((row) => row.id))];
+    if (ids.length === 0) return out;
+    try {
+      const active = await publishApprovalStore.readActiveMany(ids.map((id) => `publish-${id}`));
+      for (const [requestId, row] of active) {
+        const match = /^publish-(\d+)$/.exec(requestId);
+        if (!match) continue;
+        out.set(Number(match[1]), {
+          approved: row.approved,
+          dispatchState: row.dispatchState,
+          dispatchBlockedReason: row.dispatchBlockedReason,
+          decidedAt: row.decidedAt,
+        });
+      }
+    } catch (err) {
+      console.warn(
+        '[aidcp-api] 授权下发进度读取失败（投影回落既有呈现）:',
+        err instanceof Error ? err.message : String(err),
+      );
+    }
+    return out;
+  };
+  // 面板与客户鉴权共用的两个取数口。**同样提成具名 const**：内联在 panelDeps 里时
+  // 客户鉴权那侧引不到，只能各 new 一个 —— 两份客户端各自缓存、各自重试，
+  // 漂开的现形方式是同一个账号在后台与客户端看到两份不同的发布队列。
+  const publishStatus = new PublishStatusHttpClient(contentHttp);
+  const panelStore = new PgPanelStore({ pool, automation: new PanelAutomationHttpClient(automationHttp) });
   const panelDeps: PanelDeps = {
     publishLogStore,
     botChatStore: apiFeishu.botChatStore,
@@ -1932,8 +2003,8 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
     // 三个同步读镜像口整体展开：**别在这里重新包一层**——包一层就得自己处理「口不存在」，
     // 而那正是把「镜像没就绪」悄悄变成「答 0」的入口。
     ...syncReadPanelEvidence,
-    panelStore: new PgPanelStore({ pool, automation: new PanelAutomationHttpClient(automationHttp) }),
-    publishStatus: new PublishStatusHttpClient(contentHttp),
+    panelStore,
+    publishStatus,
     riskCommands,
     riskRead,
     writeApprovalSignal: (requestId, approved, payload, decidedBy) =>
@@ -2128,6 +2199,64 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
     // 于是客户鉴权那侧按 name 判的「诚实回 503」会退化成 500。修法是给 listForClient
     // 补一条受鉴权版本（getOneForAccount 已经有了）。
     curatedContent: new CuratedContentHttpClient(contentHttp),
+    // 稿件三个写动作。实现本进程全有，只是没接。
+    publishDraftActions: {
+      // **走权威层 `publishLog`、不走裸的 `publishLogStore`**：前者在提交成功后会推一次
+      // 预览刷新，后者不会。接错了不报错、稿件也确实改了 —— 只是桌面端看到的还是旧的，
+      // 用户会以为没保存上。注意参数顺序：契约是 (accountId, actor)，而 editDraft 是
+      // (editor, expectedAccountId)，两者位置相反。
+      edit: (recordId, expectedVersion, patch, accountId, actor) =>
+        publishLog.editDraft(recordId, expectedVersion, patch, actor, accountId),
+      approve: (payload, accountId, actor) =>
+        clientPublishActions.decidePublishApproval(payload, accountId, actor),
+      // 这个 handler 收的是 `(payload, { accountId, actor })`，契约给的是三个平铺参数，
+      // 与单体在 api 模式下的包装逐字同形。
+      removeImage: (payload, accountId, actor) =>
+        clientPublishActions.removeDraftImage(payload, { accountId, actor }),
+    },
+    // 客户发布队列。八个上游全在本进程；两个取数口用上面提出来的具名 const。
+    publishQueue: {
+      platformForAccount: (accountId) => accountStore.platformFor?.(accountId),
+      viewForAccount: async (accountId) => {
+        try {
+          const queue = await publishStatus.getStatus();
+          // 只留本账号的 runs，并**刻意丢掉全局 aggregate snapshot**：终态 snapshot 没有稳定账号键，
+          // 让它穿过客户边界等于把别的账号的最近一轮泄给这个客户。该账号的 recent 只以发布台账为准。
+          const accountRuns = (queue.runs ?? []).filter((run) => run.accountId === accountId);
+          const [pending, recent, tasks] = await Promise.all([
+            panelStore.publishedHistory(50, accountId, 'pending_approval'),
+            panelStore.publishedHistory(10, accountId),
+            delegatedTasks.list({
+              accountId,
+              actionFamily: 'publish',
+              statuses: ['queued', 'planning', 'deferred'],
+              limit: 50,
+            }),
+          ]);
+          const lifecycle = buildPublishLifecycle({
+            queue: {
+              status: accountRuns.length > 0 ? 'running' : 'idle',
+              snapshot: null,
+              runs: accountRuns,
+            },
+            pending,
+            recent,
+            inFlightEvidence: syncReadMirrors.inFlightEvidence(),
+            recentLimit: 5,
+            approvalDispatch: await readApprovalDispatchProjection([...pending, ...recent]),
+          });
+          return projectClientPublishQueue({ accountId, lifecycle, tasks });
+        } catch (err) {
+          // 单体在这里同样是 warn + null。**null 在客户端会渲染成「这个账号没有发布队列」**，
+          // 而真相是「问不到」——两者同形是既有缺陷，本批照搬、不扩大，但日志必须留。
+          console.warn(
+            `[aidcp-api] 客户发布队列取数失败 account=${accountId}: `
+              + (err instanceof Error ? err.message : String(err)),
+          );
+          return null;
+        }
+      },
+    },
   };
 
   return {

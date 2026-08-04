@@ -77,12 +77,6 @@ const DELIBERATELY_ABSENT: Readonly<Record<string, string>> = {
     + ' 客户端会安静地少渲染一块 —— 正是「静默假成功」。',
   personaAutoFill: 'TODO：待归类（本批未调查）。',
   operatorAlias: 'TODO：待归类（本批未调查；单体里是条件展开，取决于 accountStore.setOperatorAlias 是否存在）。',
-  publishQueue:
-    'LOCAL_WIRE（待接线）：全部上游本进程已有，只是 PgPanelStore 与 PublishStatusHttpClient'
-    + ' 目前内联在 panelDeps 里、需先提成具名变量。**不是能力缺失，是没接。**',
-  publishDraftActions:
-    'LOCAL_WIRE（待接线）：三个方法的实现本进程已构造完毕。接线时 edit MUST 走 publishLog 权威层、'
-    + ' 不能走裸的 publishLogStore —— 后者绕过预览推送，稿件改了而桌面端预览不刷新（静默假成功）。',
 };
 
 /** 抠出 `export interface ClientAuthDeps { … }` 的**顶层**字段名。 */
