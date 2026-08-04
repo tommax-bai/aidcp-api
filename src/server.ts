@@ -1152,13 +1152,23 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
    * 照样注册路由，理由与面板事件入口那条相同：先让「对面接得住」成立，
    * 免得接生产方那天才发现路由根本不存在。缺的另一半已具名登记，MUST NOT 读成「补完这里就通了」。
    */
+  /**
+   * 本域配置镜像版本表的写口。
+   *
+   * **本进程有真实写口，所以必须接它**：客户端建环境那条链路就活在本进程里，它一笔事务
+   * 往 Facebook 运营策略与主浏览面两张表各插一行 —— 那正是同步读那条流的载荷来源。
+   * 不推版本的后果不是「配置晚点生效」，而是同一个游标发出两种载荷摘要、消费方永久拒收：
+   * 2026-08-04 dev 实测，一个客户端建了个新 Facebook 环境之后，单体重启**直接启动失败**。
+   */
+  const mirrorVersionStore = new MirrorVersionStore({ pool });
   const configMirrorBumpSink: ConfigMirrorBumpSink = new PgConfigMirrorBumpSink({
     pool,
-    versionStore: new MirrorVersionStore({ pool }),
+    versionStore: mirrorVersionStore,
     logger: console,
   });
   const clientUserStore = new ClientUserStore({
     pool,
+    mirrorVersionBumper: mirrorVersionStore,
     executionTarget: target,
     schemaEnsurer: migrationManagedSchema,
   });
@@ -1201,6 +1211,9 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
    */
   const facebookOperationPolicy = new FacebookOperationPolicyStore({
     pool,
+    // 同上：本进程既是这张表的读方也是写方（面板与客户端两条写口都在这里），
+    // 不接推进器 = 写完不推版本 = 同步读那条流下一次就卡死。
+    mirrorVersionBumper: mirrorVersionStore,
     schemaProber: probeSchemaShape,
     executionTarget: target,
   });
