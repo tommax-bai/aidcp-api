@@ -6,6 +6,7 @@ import {
   type SyncReadPayloadByStream,
 } from 'aidcp-kernel/kernel/sync-read-facts.js';
 import { parseSyncReadPersonaSoul } from 'aidcp-kernel/kernel/persona-soul-parse.js';
+import { resolveFacebookSlowStartFromView } from 'aidcp-kernel/kernel/facebook-operation-policy-resolution.js';
 import {
   compareUnsignedSyncReadCursor,
   SyncReadConsumerCheckpointStore,
@@ -194,6 +195,8 @@ import { PanelAutomationHttpClient } from 'aidcp-transport/transport/panel-autom
 import { PublishStatusHttpClient } from 'aidcp-transport/transport/publish-status-http.js';
 import { RiskCommandHttpClient } from 'aidcp-transport/transport/risk-command-http.js';
 import { RiskReadHttpClient } from 'aidcp-transport/transport/risk-read-http.js';
+import { CuratedContentHttpClient } from 'aidcp-transport/transport/curated-content-http.js';
+import { projectClientEnvironmentSchedule } from './client-auth/client-environment-schedule.js';
 import { GroupRouteHttpClient } from 'aidcp-transport/transport/group-route-http.js';
 import { AlertResolutionHttpClient } from 'aidcp-transport/transport/alert-resolution-http.js';
 import {
@@ -1189,10 +1192,30 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
     pool,
     schemaEnsurer: migrationManagedSchema,
   });
+  // 全局周活跃掩码的来源。单体从 sessionConfigStore 直接读；本进程没有那个存储，
+  // 事实经 `session_config` 同步读流进到镜像里，而镜像建在下面（本行拿不到）⇒ 用惰性引用。
+  //
+  // ⚠ **这里有一处表达不出来的三态**：镜像答的是「新鲜/陈旧 + 值」，而本存储的选项只收
+  // `string | null`，null 会被下游投影当成「没配全局掩码」⇒ 回落全天活跃。
+  // 于是「镜像陈旧」与「确实没配」在客户端上同形，都显示「全天活跃」——
+  // 而前者是一句**错话**（真实浏览时段可能是受限的）。收窄这个契约要动存储签名，
+  // 不在本批范围内；**此处至少让陈旧留痕**，别让它连日志都没有。
+  let syncReadMirrorsRef: ApiSyncReadMirrors | null = null;
   const contentSchedule = new ContentScheduleStore({
     pool,
     schemaEnsurer: migrationManagedSchema,
     scheduledAutomationCatalog: SCHEDULED_AUTOMATION_CATALOG_READER,
+    globalActiveWeekMask: () => {
+      const mask = syncReadMirrorsRef?.weekActiveMask();
+      if (!mask || mask.state !== 'fresh') {
+        console.warn(
+          `[aidcp-api] 全局周活跃掩码镜像非 fresh（state=${mask?.state ?? 'uninitialized'}），`
+            + '本次按「未配置」处理 —— 客户端会显示全天活跃，那可能与真实浏览时段不符',
+        );
+        return null;
+      }
+      return mask.value;
+    },
   });
   const facebookCommentConfig = new FacebookCommentConfigStore({
     pool,
@@ -1751,6 +1774,8 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
     },
   });
   const syncReadMirrors = new ApiSyncReadMirrors(target);
+  // 兑现上面那条惰性引用（内容排期存储要读全局周活跃掩码）。
+  syncReadMirrorsRef = syncReadMirrors;
   const syncReadConsumer = new ApiSyncReadConsumerRuntime(
     syncReadMirrors,
     createApiSyncReadConsumerCheckpointStore(pool, target),
@@ -1866,6 +1891,25 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
   // 猜不中则是一个没人访问的监听口）。
   const panelEventFanout = new PanelEventFanout();
   const syncReadPanelEvidence = createApiSyncReadPanelEvidencePorts(syncReadMirrors);
+  // 风控只读投影口。**提成具名 const 而不是内联进 panelDeps**：面板、客户鉴权、
+  // 以及下面那条慢启动 resolver 绑定要的是**同一个**投影口。各自 new 一个不会报错，
+  // 但那就是三份各自缓存、各自重试的客户端，漂开的现形方式不是异常而是
+  //「同一个账号在后台看到一档、在客户端看到另一档」。
+  const riskRead = new RiskReadHttpClient(automationHttp);
+  /** 风控写命令口。同上：面板与客户鉴权用同一个，别各 new 各的。 */
+  const riskCommands = new RiskCommandHttpClient(automationHttp, { executionTarget: target });
+  // 「风控慢启动投影 → Facebook 慢启动解析」的绑定。单体在自动化段用本进程 riskRegistry 绑
+  // （server.ts 的 bindSlowStartResolver 处）；本进程没有 registry，改用同一个只读投影口。
+  //
+  // **本仓此前一次都没绑过** ⇒ 策略存储里的 resolver 恒为空 ⇒ 每次解析都走它的兜底分支、
+  // 回 `blocker: 'slow_start_projection_unavailable'`。那条兜底本身是诚实的（它没有假装知道），
+  // 但它诚实报告的是一个**接线漏洞**，不是「这个账号确实查不到慢启动」——
+  // 两者在客户端上完全同形，所以漏了三个月也不会有人发现。
+  //
+  // 映射函数取自共享包、**MUST NOT 在本仓重写一份**：同一个映射两处实现，漂开时的现形方式
+  // 不是报错，而是某一侧把一个还在爬坡的新账号按满档跑。
+  facebookOperationPolicy.bindSlowStartResolver(async (accountId) =>
+    resolveFacebookSlowStartFromView(await riskRead.slowStartView(accountId)));
   const panelDeps: PanelDeps = {
     publishLogStore,
     botChatStore: apiFeishu.botChatStore,
@@ -1890,8 +1934,8 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
     ...syncReadPanelEvidence,
     panelStore: new PgPanelStore({ pool, automation: new PanelAutomationHttpClient(automationHttp) }),
     publishStatus: new PublishStatusHttpClient(contentHttp),
-    riskCommands: new RiskCommandHttpClient(automationHttp, { executionTarget: target }),
-    riskRead: new RiskReadHttpClient(automationHttp),
+    riskCommands,
+    riskRead,
     writeApprovalSignal: (requestId, approved, payload, decidedBy) =>
       writeApprovalDecision(requestId, approved, payload, { decidedBy, decidedVia: 'console' }),
     readApprovalDispatchStates: (requestIds) => publishApprovalStore.readActiveMany(requestIds),
@@ -1983,6 +2027,107 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
         approvalPolicy.setOwnedEnvironmentCommentMode(userId, envKey, mode, updatedBy),
     },
     delegatedTasks,
+    // 人设三方法 + 平台解析。**全在本进程里**：本仓就是 persona 的属主，
+    // `registerAccountPersonaRoutes` 正把同一套能力经内部 HTTP 供给别的进程用，
+    // 而自己的客户鉴权口此前答 503 —— 供得出去、自己用不上。
+    // （单体那处的 `requireSegment(..., 'automation')` 标签是写错的：第三个参数只用于拼错误文案，
+    //   而 api 模式下这个句柄本来就由 api 段自己赋值。别照着标签下判断。）
+    // **直接绑方法、不重写一遍参数表**：三个方法的签名各不相同（`generate` 收单个入参对象），
+    // 手抄一份等于在这里造第二处签名，改上游时这里编译还过、行为已经错位。
+    persona: {
+      get: accountPersona.get.bind(accountPersona),
+      generate: accountPersona.generate.bind(accountPersona),
+      persist: accountPersona.persist.bind(accountPersona),
+      platformForAccount: (accountId) => accountStore.platformFor?.(accountId),
+    },
+    // account→edge 反查。**不是"本进程没有立场答"**（交接文档 §3.1 曾把它列进"注定答不了"那批，
+    // 实测有误）：边缘在场事实已经由 `edge_presence` 同步读流实时进到本进程的镜像里，
+    // 镜像上就有同名同签名的解析。
+    //
+    // **镜像不新鲜时它对所有账号回 null**，而调用方 `attestLiveBinding` 据此判「该账号此刻是否
+    // 真跑在这个环境上」⇒ 回 409 `binding_unverified`。方向是 fail-closed（误拒可接受、误放不可接受），
+    // 与该判据本身的设计口径一致；但「镜像陈旧」与「账号真不在线」在这一层同形，
+    // 故此处按镜像状态留痕，别让运维只看到一句 binding_unverified 就去查账号。
+    resolveEdgeIdForAccount: (accountId) => {
+      const presence = syncReadMirrors.presence();
+      if (presence.state !== 'fresh') {
+        console.warn(
+          `[aidcp-api] 边缘在场镜像非 fresh（state=${presence.state}），`
+            + `account→edge 反查按 fail-closed 回 null：accountId=${accountId}`,
+        );
+        return null;
+      }
+      return presence.resolveEdgeIdForAccount(accountId);
+    },
+    // 环境风控状态 + 受限恢复提交/回读。四个上游全在本进程：平台解析本地、
+    // 风控读写各经已有的只读投影口与写命令口。
+    //
+    // 三处 `catch → null` 逐字照单体：调用方把 null 读作「这项暂时给不出」，
+    // 而不是「该账号没有风控状态」。**MUST NOT 改成抛**——它在客户端上是一块可降级的展示。
+    environmentRisk: {
+      platformForAccount: (accountId) => accountStore.platformFor?.(accountId),
+      viewForAccount: async (accountId) => {
+        try {
+          const state = await riskRead.getState(accountId);
+          return { status: state.status, statusSince: state.statusSince, updatedAt: state.updatedAt };
+        } catch {
+          return null;
+        }
+      },
+      submitRestrictedRecovery: async (envKey, accountId, reason, requestedBy) => {
+        try {
+          return await riskCommands.submitRestrictedRecovery({ envKey, accountId, reason, requestedBy });
+        } catch {
+          return null;
+        }
+      },
+      restrictedRecoveryOutcomeOf: async (commandId, envKey, accountId) => {
+        try {
+          const outcome = await riskCommands.restrictedRecoveryOutcomeOf(commandId, envKey, accountId);
+          if (outcome.state !== 'applied' && outcome.state !== 'refused') return outcome;
+          const risk = outcome.risk;
+          // 终态却带着一个不认识的风控状态 ⇒ 具名成 `recovery_outcome_incomplete`，
+          // **MUST NOT 原样透传**：把一个没读懂的值当成结论传下去，下游会拿它当真。
+          if (
+            risk.status !== 'normal'
+            && risk.status !== 'warned'
+            && risk.status !== 'restricted'
+            && risk.status !== 'frozen'
+          ) {
+            console.warn('[aidcp-api] 受限恢复回执带回了无法识别的风控状态', {
+              commandId,
+              envKey,
+              rawStatus: String(risk.status),
+            });
+            return { commandId, state: 'failed' as const, reason: 'recovery_outcome_incomplete' };
+          }
+          return {
+            ...outcome,
+            risk: {
+              status: risk.status,
+              statusSince: risk.statusSince,
+              updatedAt: risk.updatedAt,
+            },
+          };
+        } catch {
+          return null;
+        }
+      },
+    },
+    // 环境浏览时段。三个上游全在本进程（本仓就是这三张排期表的属主），纯接线。
+    environmentSchedule: {
+      platformForAccount: (accountId) => accountStore.platformFor?.(accountId),
+      viewForAccount: (accountId) =>
+        projectClientEnvironmentSchedule(contentSchedule.effectiveScheduleFor(accountId)),
+    },
+    // 精选内容读。**不是新通道**：`aidcp-transport` 里早有这个客户端，content 进程也早就
+    // 注册了对应路由，且挂在本进程已经在用的那个 content 内部口上 —— 缺的只是这一行。
+    //
+    // ⚠ 已知残留（本批不修，登记在 test/acceptance/client-auth-deps-inventory.test.ts）：
+    // 这族是裸路由，属主侧的「精选库不可用」错误跨进程后 `name` 会丢，
+    // 于是客户鉴权那侧按 name 判的「诚实回 503」会退化成 500。修法是给 listForClient
+    // 补一条受鉴权版本（getOneForAccount 已经有了）。
+    curatedContent: new CuratedContentHttpClient(contentHttp),
   };
 
   return {
