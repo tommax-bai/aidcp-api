@@ -59,8 +59,36 @@ import type {
 } from 'aidcp-kernel/kernel/role-model-selection-port.js';
 import {
   normProvider,
+  isKnownProvider,
   type TextProviderId,
 } from 'aidcp-kernel/kernel/text-provider-registry.js';
+// change restore-panel-capability-wiring：平台配置视图要的厂商元数据。
+// 身份（展示名 / 凭据字段 / env 回退键）在 kernel，端点（baseUrl）在共享传输包里的厂商表——
+// 两处都不是内容进程私有物，本进程直接取，不为了一个只读展示值去开跨进程口。
+import {
+  IMAGE_PROVIDERS,
+  normImageProvider,
+  type ImageProviderId,
+} from 'aidcp-kernel/kernel/image-provider-registry.js';
+import { TEXT_PROVIDERS, resolveProviderBaseUrl } from 'aidcp-transport/llm/providers.js';
+import { buildThinkingParams } from 'aidcp-transport/llm/qwen.js';
+import { ModelProbeHttpClient } from 'aidcp-transport/transport/model-probe-http.js';
+import {
+  PLATFORM_CREDENTIALS,
+  resolvePlatformCredentialEnvValue,
+} from './config/platform-credentials.js';
+import { createRoleConfigPanel } from './config/role-config-facade.js';
+import { createCategoryConfigPanel } from './config/category-config-facade.js';
+import { HotLeadConfigStore } from './config/hot-lead-config-store.js';
+import { createHotLeadConfigPanel } from './config/hot-lead-config-facade.js';
+import { FacebookGroupCommentPolicyStore } from './config/facebook-group-comment-policy-store.js';
+import { buildInteractionPermissionOverview } from './interactions/interaction-panel-permissions.js';
+import { parseInteractionPanelGrants } from './interactions/interaction-internal-api.js';
+import {
+  assertPanelCapabilityCoverage,
+  type PanelCapabilityAbsences,
+} from './panel/capability-coverage.js';
+import type { ModelConfigView } from './panel/types.js';
 import {
   EdgeResumeCommandHttpClient,
   FacebookScopeCommandHttpClient,
@@ -1369,6 +1397,24 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
     mirrorVersionBumper: mirrorVersionStore,
   });
   const credentialStore = new CredentialStore({ pool, schemaEnsurer: migrationManagedSchema });
+  // change restore-panel-capability-wiring：两张同样是本域属主、同样只被管理后台读写的配置表。
+  // 它们此前一次也没在本进程构造过 —— 面板于是逐路由回 503，后台「配额页·热帖引流」与
+  // 「FB 群评论策略」两处整块打不开。构造它们不引入任何跨域依赖。
+  const hotLeadConfigStore = new HotLeadConfigStore({
+    pool,
+    schemaEnsurer: migrationManagedSchema,
+    mirrorVersionBumper: mirrorVersionStore,
+  });
+  // 群评论时序策略：与单体同口径带上两个 legacy env 回落（旧部署的覆盖值仍要认，
+  // 否则一次拆进程会把运营早先配的窗口悄悄改回默认）。
+  const facebookGroupCommentPolicyStore = new FacebookGroupCommentPolicyStore({
+    pool,
+    executionTarget: target,
+    schemaProber: probeSchemaShape,
+    mirrorVersionBumper: mirrorVersionStore,
+    legacyWarmupHours: () => process.env.AIDCP_FB_GROUP_COVERAGE_WARMUP_HOURS,
+    legacyRecommentCooldownHours: () => process.env.AIDCP_FB_GROUP_COVERAGE_COOLDOWN_HOURS,
+  });
 
   await Promise.all([
     accountStore.init(),
@@ -1387,6 +1433,8 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
     roleConfigStore.init(),
     categoryConfigStore.init(),
     credentialStore.init(),
+    hotLeadConfigStore.init(),
+    facebookGroupCommentPolicyStore.init(),
     migrationManagedSchema(pool, {
       capability: 'publish_approval',
       sinceVersion: '0063_publish_approval_decision',
@@ -2105,6 +2153,101 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
   /** 客户提交离场后的即时派发触发。目标边缘由属主进程解析，本进程只给 accountId。 */
   const interactionOffboard = new InteractionOffboardHttpClient(automationHttp);
   const panelStore = new PgPanelStore({ pool, automation: new PanelAutomationHttpClient(automationHttp) });
+
+  // ── 面板配置外观（change restore-panel-capability-wiring）──────────────────────────
+  //
+  // 这一段全部只依赖**本进程属主**的四张配置表 + 凭据表 + 两张厂商登记表，零跨域。
+  // 单体把它们建在自动化段里并用跨段取用闸包着 —— 那是**历史位置，不是归属**；照抄那个闸
+  // 会让本进程平白依赖一个它根本没跑的段。
+  //
+  // 唯一真跨域的是**保存前探活**：它真发一次模型调用，文本厂商客户端归内容进程。
+
+  /** 平台配置视图（GET /api/config/model 与写后回真态共用）。永不含明文密钥。 */
+  const buildModelConfigView = async (): Promise<ModelConfigView> => {
+    const cfg = modelConfigStore.getCached();
+    const providers = (Object.keys(TEXT_PROVIDERS) as TextProviderId[]).map((id) => ({
+      id,
+      displayName: TEXT_PROVIDERS[id].displayName,
+      baseUrl: resolveProviderBaseUrl(id),
+    }));
+    const credentials = await Promise.all(
+      PLATFORM_CREDENTIALS.map(async (cred) => {
+        const stored = await credentialStore.getStored(cred.provider, cred.field).catch(() => null);
+        const envPresent = !!resolvePlatformCredentialEnvValue(cred);
+        const base = {
+          provider: cred.provider,
+          field: cred.field,
+          label: cred.label,
+          providerLabel: cred.providerLabel,
+          group: cred.group,
+          groupLabel: cred.groupLabel,
+          secretKind: cred.secretKind,
+          restartRequired: cred.restartRequired,
+        };
+        return stored
+          ? { ...base, configured: true, maskedHint: stored.maskedHint, source: 'db' as const }
+          : envPresent
+            ? { ...base, configured: true, maskedHint: '（来自环境变量）', source: 'env' as const }
+            : { ...base, configured: false, maskedHint: null, source: 'none' as const };
+      }),
+    );
+    const imageProviders = (Object.keys(IMAGE_PROVIDERS) as ImageProviderId[]).map((id) => ({
+      id,
+      displayName: IMAGE_PROVIDERS[id].displayName,
+    }));
+    return {
+      textProvider: normProvider(cfg.textProvider),
+      imageProvider: normImageProvider(cfg.imageProvider),
+      textModel: cfg.textModel,
+      imageModel: cfg.imageModel,
+      providers,
+      imageProviders,
+      credentials,
+      canEditCredential: credentialStore.canEdit(),
+    };
+  };
+
+  // 探活客户端。**三态**在这条边上必须保持可分：对面答「密钥缺失 / 模型不可用」是真实答案；
+  // 没问到对面是第三态 `probe_unavailable`，由客户端产出。三处写路径共用这一个口，
+  // MUST NOT 各写一份分类 —— 第二份实现在行为测试上原理不可见。
+  const modelProbe = new ModelProbeHttpClient(contentHttp);
+  const thinkingOnAvailable = (provider: string, model: string): boolean =>
+    Object.keys(buildThinkingParams(provider, model, 'on').params).length > 0;
+
+  const roleConfigPanel = createRoleConfigPanel({
+    store: roleConfigStore,
+    getGlobalTextModel: () => modelConfigStore.getCached().textModel,
+    getGlobalTextProvider: () => modelConfigStore.getCached().textProvider,
+    getGlobalImageModel: () => modelConfigStore.getCached().imageModel,
+    getGlobalImageProvider: () => modelConfigStore.getCached().imageProvider,
+    getCategoryModel: (categoryId) => categoryConfigStore.getForCategory(categoryId).model,
+    getCategoryProvider: (categoryId) => categoryConfigStore.getForCategory(categoryId).provider,
+    getCategoryThinking: (categoryId) => categoryConfigStore.getForCategory(categoryId).thinkingMode,
+    thinkingOnAvailable,
+    // 封面表单感知角色的生效模型 / 厂商在内容域（视觉出口）。本进程没有立场答，
+    // 展示全局图片档位而不是编一个 —— 这是**展示回落**，不是假装知道：两者取值同源，
+    // 只在内容侧另配了封面专用模型时才会偏。已登记 backlog（簇 60）。
+    getVisionModel: () => modelConfigStore.getCached().imageModel,
+    getVisionProvider: () => modelConfigStore.getCached().imageProvider,
+    probeModel: (provider, model) => modelProbe.probeModel(provider, model),
+  });
+  const categoryConfigPanel = createCategoryConfigPanel({
+    store: categoryConfigStore,
+    getGlobalTextModel: () => modelConfigStore.getCached().textModel,
+    getGlobalTextProvider: () => modelConfigStore.getCached().textProvider,
+    thinkingOnAvailable,
+    probeModel: (provider, model) => modelProbe.probeModel(provider, model),
+  });
+  const hotLeadConfigPanel = createHotLeadConfigPanel({ store: hotLeadConfigStore });
+
+  // 视频号互动权限只读总览：`buildInteractionPermissionOverview` 是**纯函数**，两个入参
+  // （面板用户表、授权配置）都是本进程可得的配置。单体把它建在自动化段，于是它在拆仓映射里
+  // 被当成跨段依赖 —— 实则零跨域。
+  const panelUsers = parsePanelUsers(process.env.AIDCP_PANEL_USERS);
+  const interactionPermissionOverview = buildInteractionPermissionOverview(
+    panelUsers,
+    parseInteractionPanelGrants(process.env.AIDCP_INTERACTION_PANEL_GRANTS),
+  );
   const panelDeps: PanelDeps = {
     publishLogStore,
     botChatStore: apiFeishu.botChatStore,
@@ -2204,7 +2347,132 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
     pacingConfig: new PanelPacingConfigHttpClient(automationHttp),
     sessionLimits: new PanelSessionLimitsHttpClient(automationHttp),
     resumeConfig: new PanelResumeConfigHttpClient(automationHttp),
+
+    // ── change restore-panel-capability-wiring：本域属主、此前一项都没装上的六项 ──────
+    // 它们全部只读写本进程属主的配置表，不经任何跨进程通道。
+    modelConfig: {
+      getView: buildModelConfigView,
+      setModel: async (patch, updatedBy) => {
+        const cfg = modelConfigStore.getCached();
+        const wantTextModel = typeof patch.textModel === 'string' && patch.textModel.trim() !== '';
+        const wantTextProvider =
+          typeof patch.textProvider === 'string' && patch.textProvider.trim() !== '';
+        // 解析本次生效的文本厂商（变更则用新值、否则沿用当前）；未知厂商诚实拒，绝不落库。
+        let provider: string;
+        if (wantTextProvider) {
+          const p = (patch.textProvider as string).trim();
+          if (!isKnownProvider(p)) return { ok: false, reason: 'unknown_provider' as const };
+          provider = p;
+        } else {
+          provider = normProvider(cfg.textProvider);
+        }
+        // 文本模型或厂商任一变更 → 按生效厂商对生效模型探活
+        //（某厂商上合法的模型名在另一厂商未必合法）。
+        if (wantTextModel || wantTextProvider) {
+          const modelToProbe = wantTextModel ? (patch.textModel as string).trim() : cfg.textModel;
+          const probe = await modelProbe.probeModel(provider, modelToProbe);
+          if (!probe.ok) {
+            // 三态各自出口。**MUST NOT 因为没能探活就放行写入** —— 那会让一个打错的模型名
+            // 静默落库，直到某个角色真去调用才炸。
+            if (probe.reason === 'provider_key_missing') {
+              return { ok: false, reason: 'provider_key_missing' as const };
+            }
+            if (probe.reason === 'probe_unavailable') {
+              return { ok: false, reason: 'probe_unavailable' as const };
+            }
+            return { ok: false, reason: 'model_invalid' as const };
+          }
+        }
+        const storePatch: {
+          textModel?: string;
+          textProvider?: string;
+          imageModel?: string;
+          imageProvider?: string;
+        } = {};
+        if (wantTextModel) storePatch.textModel = (patch.textModel as string).trim();
+        if (wantTextModel || wantTextProvider) storePatch.textProvider = provider;
+        if (typeof patch.imageModel === 'string' && patch.imageModel.trim())
+          storePatch.imageModel = patch.imageModel.trim();
+        // 图片厂商未知则归一（不 brick，与图片路由归一一致），非文本探活范畴。
+        if (typeof patch.imageProvider === 'string' && patch.imageProvider.trim())
+          storePatch.imageProvider = normImageProvider(patch.imageProvider);
+        await modelConfigStore.set(storePatch, updatedBy);
+        return { ok: true, view: await buildModelConfigView() };
+      },
+      setCredential: async (provider, field, value, updatedBy) => {
+        if (!credentialStore.canEdit()) return { ok: false, reason: 'cred_key_missing' as const };
+        const { maskedHint } = await credentialStore.setSecret(provider, field, value, updatedBy);
+        return { ok: true, provider, field, maskedHint };
+      },
+    },
+    roleConfig: roleConfigPanel,
+    categoryConfig: categoryConfigPanel,
+    hotLeadConfig: hotLeadConfigPanel,
+    facebookGroupCommentPolicy: facebookGroupCommentPolicyStore,
+    interactionPermissions: { getView: () => interactionPermissionOverview },
+
+    // ── change restore-panel-capability-wiring：单体组装根里已写好 api 分支的三项 ─────
+    // 它们不走路由，缺席时**连 503 都不会给** —— 面板调用点写的是可选依赖，没有就什么都不发生。
+    // 后台表现：待审稿件抽屉能打开、编辑保存却永远 404；改完稿件桌面端看到的还是旧的；
+    // 客户提交离场后不触发即时派发。三种都不会有人报警。
+    publishDraft: {
+      // **走裸 store、不走带预览推送的权威层**：面板在编辑成功后自己调
+      // `notifyPublishPreviewChanged`（见 panel-server 那处），接权威层会推两次。
+      edit: (recordId, expectedVersion, patch, editor) =>
+        publishLogStore.editDraft(recordId, expectedVersion, patch, editor),
+      liveVersion: (recordId) =>
+        publishLogStore.loadForDispatch(recordId).then((draft) => draft?.contentVersion ?? null),
+      hasDecision: async (recordId) =>
+        (await publishApprovalClient.readApproval(`publish-${recordId}`)) !== null,
+    },
+    notifyPublishPreviewChanged: (recordId) => {
+      void publishUi.pushPreview(recordId).catch((err) =>
+        console.warn(
+          `[publish-ui-update] panel preview delivery failed recordId=${recordId}: `
+            + `${err instanceof Error ? err.message : String(err)}`,
+        ),
+      );
+    },
+    // 客户提交离场后的即时派发。**不在这里解析 edgeId**：推送目标由属主进程就地解析。
+    // accountId 为 null = 已受理、属主还没物化出账号，此刻没有可派发的目标，MUST NOT 猜一个。
+    onClientOffboardCreated: async (offboard) => {
+      if (!offboard.accountId) return;
+      await interactionOffboard.dispatchPendingOffboards(offboard.accountId);
+    },
   };
+
+  // ── 装配对账（change restore-panel-capability-wiring）─────────────────────────────
+  //
+  // 本进程**不提供**哪些面板能力，必须是写下来的决定，不是一次静默的遗漏。
+  // 这张表只准缩短；每条写清「为什么不装 + 管理后台上的表现」。
+  // 少写一项、或装上了却忘了删条目，下面那句断言会让进程起不来。
+  const panelCapabilityAbsences: PanelCapabilityAbsences = {
+    captchaAssist:
+      '验证码协助的现场（阻断快照 / 截图 / 点击回放）在自动化进程的边缘接入层，本进程没有；'
+      + '后台「验证码协助」页整页不可用。跨进程窄口见 change restore-panel-capability-wiring 批次 4。',
+    tokenUsage: '用量台账是内容属主表，本进程不开它的池；后台「用量成本」页不可用。批次 3。',
+    billingPriceRefresh: '同 tokenUsage：账单价刷新要读内容域的用量表与厂商账单口。批次 3。',
+    curatedContent: '精选库是内容属主表；后台「精选库」页列表 / 筛选 / 删除全不可用。批次 3。',
+    curatedActions:
+      '行级动作要发起发布管线（内容域的并行洗稿准入）与定向评论调度（自动化域），'
+      + '两个域都不在本进程；后台精选库行内两个按钮不可用。批次 4。',
+    facebookPublishMedia:
+      'FB 发帖素材库是内容属主表；后台 FB 发帖的图片列表 / 上传 / 重排不可用。批次 3。',
+    preflightApprovePublish: '授权前置校验在自动化进程。批次 4。',
+    publishDispatcher: '下发在途记录号在自动化进程；面板已有同步读镜像兜住在途证据。批次 4。',
+    rolePromptPreview:
+      '角色提示词预览要同时用到自动化域的预览调度器与内容域的渲染闭包表，'
+      + '本进程只有人设那一段；后台角色页的「查看提示词」不可用。批次 7。',
+    interactionInternalApi: '视频号内部配置 API 由客户端鉴权面单独承载，面板不复用这一族。',
+    configMirrorHealth:
+      '旧版单服务镜像健康视图；本进程改用按服务分域的 configMirrorServicesHealth，'
+      + '后台「配置镜像」页读的是后者，不受影响。',
+    facebookRuleMode: 'FB 规则模式运行时在自动化进程；后台该块由环境页的策略视图承载。',
+    botChats:
+      '飞书会话清单在本进程有属主存储（botChatStore，面板必填口），/api/bot-chats 由它兜住；'
+      + '这个可选口是单体给自动化侧另一套会话提供方留的，本进程不需要第二条路径。',
+  };
+  assertPanelCapabilityCoverage(panelDeps, panelCapabilityAbsences, 'aidcp-api');
   // ── 客户端收件箱（change deploy-derived-services-to-dev）────────────────────────
   //
   // 五个依赖里三个在自动化进程（存储读侧 / 回复工作流 / 发送编排），两个在本进程
