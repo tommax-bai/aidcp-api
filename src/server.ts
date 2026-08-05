@@ -74,6 +74,13 @@ import { TEXT_PROVIDERS, resolveProviderBaseUrl } from 'aidcp-transport/llm/prov
 import { buildThinkingParams } from 'aidcp-transport/llm/qwen.js';
 import { ModelProbeHttpClient } from 'aidcp-transport/transport/model-probe-http.js';
 import {
+  PanelBillingPriceRefreshHttpClient,
+  PanelCuratedContentHttpClient,
+  PanelFacebookMediaHttpClient,
+  PanelTokenUsageHttpClient,
+  PANEL_CONTENT_MEDIA_UPLOAD_TIMEOUT_MS,
+} from 'aidcp-transport/transport/panel-content-http.js';
+import {
   PLATFORM_CREDENTIALS,
   resolvePlatformCredentialEnvValue,
 } from './config/platform-credentials.js';
@@ -2411,6 +2418,21 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
     facebookGroupCommentPolicy: facebookGroupCommentPolicyStore,
     interactionPermissions: { getView: () => interactionPermissionOverview },
 
+    // ── change restore-panel-capability-wiring 批次 3：事实源在内容进程的三族 ────────
+    // 后台「用量成本」「精选库」「FB 发帖图片」三处此前整块 503。
+    // 账号隔离仍由属主侧那段 SQL 保证（`account_id` 进 WHERE），不靠调用方自觉。
+    tokenUsage: new PanelTokenUsageHttpClient(contentHttp),
+    billingPriceRefresh: new PanelBillingPriceRefreshHttpClient(contentHttp),
+    curatedContent: new PanelCuratedContentHttpClient(contentHttp),
+    // 上传单独走放宽超时的那条连接：大载荷传输 + 属主侧逐张落库，默认 15s 必然不够，
+    // 而超时后属主侧很可能**已经写完了** —— 那是「看起来失败其实成功」，比失败难查得多。
+    facebookPublishMedia: new PanelFacebookMediaHttpClient(
+      contentHttp,
+      new InternalHttpClient(requiredUrl('AIDCP_CONTENT_URL'), {
+        timeoutMs: PANEL_CONTENT_MEDIA_UPLOAD_TIMEOUT_MS,
+      }),
+    ),
+
     // ── change restore-panel-capability-wiring：单体组装根里已写好 api 分支的三项 ─────
     // 它们不走路由，缺席时**连 503 都不会给** —— 面板调用点写的是可选依赖，没有就什么都不发生。
     // 后台表现：待审稿件抽屉能打开、编辑保存却永远 404；改完稿件桌面端看到的还是旧的；
@@ -2450,14 +2472,9 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
     captchaAssist:
       '验证码协助的现场（阻断快照 / 截图 / 点击回放）在自动化进程的边缘接入层，本进程没有；'
       + '后台「验证码协助」页整页不可用。跨进程窄口见 change restore-panel-capability-wiring 批次 4。',
-    tokenUsage: '用量台账是内容属主表，本进程不开它的池；后台「用量成本」页不可用。批次 3。',
-    billingPriceRefresh: '同 tokenUsage：账单价刷新要读内容域的用量表与厂商账单口。批次 3。',
-    curatedContent: '精选库是内容属主表；后台「精选库」页列表 / 筛选 / 删除全不可用。批次 3。',
     curatedActions:
       '行级动作要发起发布管线（内容域的并行洗稿准入）与定向评论调度（自动化域），'
       + '两个域都不在本进程；后台精选库行内两个按钮不可用。批次 4。',
-    facebookPublishMedia:
-      'FB 发帖素材库是内容属主表；后台 FB 发帖的图片列表 / 上传 / 重排不可用。批次 3。',
     preflightApprovePublish: '授权前置校验在自动化进程。批次 4。',
     publishDispatcher: '下发在途记录号在自动化进程；面板已有同步读镜像兜住在途证据。批次 4。',
     rolePromptPreview:
