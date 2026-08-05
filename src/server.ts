@@ -322,7 +322,34 @@ import {
 } from './api-schema-gate-startup.js';
 
 const DEFAULT_API_PORT = 8094;
+/**
+ * 周期全量快照刷新的**上限**（不是默认值，见 {@link API_SYNC_READ_REFRESH_MS}）。
+ *
+ * 这个数同时是属主给每份快照标的新鲜期窗口（automation 侧 `DEFAULT_FRESH_MS`）。
+ * 把刷新周期取成它本身 —— 也就是本 change 之前的默认值 —— 意味着**每个周期末尾都有一段
+ * 「刚过期、还没重新取到」的空窗**：属主观测到我们取到之间还隔着最多一个属主重发周期，
+ * 那段差额直接落在窗口外面。
+ */
 export const API_SYNC_READ_FULL_REFRESH_MS = 30_000;
+
+/**
+ * 周期全量快照刷新的**实际周期**：新鲜期窗口的三分之一，与属主侧重发周期同比例。
+ *
+ * **这条不是调参，是「新鲜度靠谁维持」的分工**（change bound-event-outbox-growth）：
+ * 变更通知只负责把「事实变了」这件事更早送到，**MUST NOT 成为某条流保持 fresh 所必需的一环**。
+ * 判据是「假设这条流的通知全部消失，它还能不能长期保持 fresh」——周期等于窗口时答案是否。
+ *
+ * 此前 dev 上有两种表现，同一个根因：
+ *   · `session_config_global` 没有变更通知托底 ⇒ 每分钟一条
+ *     「全局周活跃掩码镜像非 fresh（state=stale），本次按『未配置』处理」，
+ *     客户端因此显示全天活跃；
+ *   · `automation_config_mirror_health` 反而不抖 —— 因为它的载荷带了个时钟、每 10 秒发一次
+ *     通知，顺手把新鲜期续上了。那个 churn 本身就是本 change 要修的 bug，
+ *     **不把周期改对，修掉 churn 就等于把这条流也推进抖动**。
+ *
+ * 比例由 `test/acceptance/api-sync-read-refresh-margin.test.ts` 钉住。
+ */
+export const API_SYNC_READ_REFRESH_MS = 10_000;
 export const API_SYNC_READ_READINESS_ROUTE =
   'internal/api/sync-read/readiness';
 
@@ -438,6 +465,9 @@ export class ApiSyncReadConsumerRuntime {
   >();
   private timer: NodeJS.Timeout | null = null;
 
+  /** 新鲜期余量告警的去重集合：配置级事实，每条流只说一次。 */
+  private readonly freshnessMarginWarned = new Set<string>();
+
   constructor(
     readonly mirrors: ApiSyncReadMirrors,
     private readonly checkpointStore: ApiSyncReadCheckpointPort,
@@ -491,6 +521,33 @@ export class ApiSyncReadConsumerRuntime {
   }
 
   /**
+   * 跨仓漂移守卫：属主给的新鲜期窗口相对本进程的刷新周期是否还留得下余量。
+   *
+   * 上面那条比例断言只钉得住**本仓**的常量；新鲜期窗口是**另一个仓**（automation）的
+   * `DEFAULT_FRESH_MS`，它变短的时候本仓什么都不会说 —— 现形方式是镜像开始周期性 stale，
+   * 而每条流单看又都「刚刚还是好的」，没有一行日志说得出问题在哪（2026-08-04 就这么过了一次）。
+   *
+   * 所以这里按**收到的真实信封**判一次：窗口 < 3 倍刷新周期即具名 warn。
+   * 每条流只说一次（它是配置级事实，不是逐次事件），且 MUST NOT 因此拒绝应用快照——
+   * 余量不够是运维问题，不是这份快照不可信。
+   */
+  private noteFreshnessMargin(
+    stream: ApiConsumedSyncReadStream,
+    envelope: { asOf: number; freshUntil: number },
+  ): void {
+    if (this.freshnessMarginWarned.has(stream)) return;
+    const window = envelope.freshUntil - envelope.asOf;
+    if (!Number.isFinite(window) || window >= API_SYNC_READ_REFRESH_MS * 3) return;
+    this.freshnessMarginWarned.add(stream);
+    this.logger.warn(
+      `[aidcp-api] sync-read 新鲜期余量不足 stream=${stream} 窗口=${window}ms `
+        + `刷新周期=${API_SYNC_READ_REFRESH_MS}ms —— 属主侧窗口变短了？`
+        + '余量不足时这条流会周期性 stale，而逐条去看又都「刚刚还是好的」。'
+        + '本次快照照常应用；这是余量告警，不是拒收。',
+    );
+  }
+
+  /**
    * A sync_read.changed delivery may call refreshStream for acceleration.
    * The periodic full cycle below remains authoritative and uses the same
    * per-stream serialization, so a missed wakeup cannot strand a delta.
@@ -518,6 +575,7 @@ export class ApiSyncReadConsumerRuntime {
             + `expected>=${minimumGeneration} actual=${envelope.cursor}`,
         );
       }
+      this.noteFreshnessMargin(stream, envelope);
       const applied = this.mirrors.apply(envelope, 'owner_fetch');
       if (applied.outcome === 'rejected') {
         throw new Error(
@@ -571,7 +629,7 @@ export class ApiSyncReadConsumerRuntime {
 
   startPeriodic(
     onCycle?: (report: ApiSyncReadRefreshReport) => void | Promise<void>,
-    intervalMs = API_SYNC_READ_FULL_REFRESH_MS,
+    intervalMs = API_SYNC_READ_REFRESH_MS,
   ): void {
     if (
       !Number.isInteger(intervalMs)

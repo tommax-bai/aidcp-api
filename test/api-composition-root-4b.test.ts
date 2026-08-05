@@ -58,7 +58,6 @@ function payload(stream: ConsumedStream): SyncReadPayloadByStream[ConsumedStream
     case 'automation_config_mirror_health':
       return {
         sourceService: 'automation',
-        asOf: 100,
         enabled: true,
         pollMs: 5_000,
         entries: [],
