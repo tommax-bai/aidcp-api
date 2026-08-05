@@ -74,6 +74,15 @@ import { TEXT_PROVIDERS, resolveProviderBaseUrl } from 'aidcp-transport/llm/prov
 import { buildThinkingParams } from 'aidcp-transport/llm/qwen.js';
 import { ModelProbeHttpClient } from 'aidcp-transport/transport/model-probe-http.js';
 import {
+  PanelCaptchaAssistHttpClient,
+  PanelPublishPreflightHttpClient,
+} from 'aidcp-transport/transport/panel-automation-extra-http.js';
+import type {
+  CaptchaAssistDispatchResult,
+  CaptchaAssistIncidentView,
+  CaptchaAssistTokenVerifyResult,
+} from './panel/captcha-assist-port.js';
+import {
   PanelBillingPriceRefreshHttpClient,
   PanelCuratedContentHttpClient,
   PanelFacebookMediaHttpClient,
@@ -2424,6 +2433,21 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
     tokenUsage: new PanelTokenUsageHttpClient(contentHttp),
     billingPriceRefresh: new PanelBillingPriceRefreshHttpClient(contentHttp),
     curatedContent: new PanelCuratedContentHttpClient(contentHttp),
+
+    // ── change restore-panel-capability-wiring 批次 4：事实源在自动化进程的两族 ───────
+    // 验证码协助的现场快照 / 令牌秘密 / edge 实时循环都在那边；不接这条口，
+    // 后台「验证码协助」整页 503 —— 运营就没有过验证码的手段。
+    // 泛型参数在这里钉上本仓的真类型：属主侧形状一旦漂移，下面这个赋值当场编译红。
+    captchaAssist: new PanelCaptchaAssistHttpClient<{
+      verify: CaptchaAssistTokenVerifyResult;
+      incident: CaptchaAssistIncidentView | null;
+      dispatch: CaptchaAssistDispatchResult;
+      submitInput: Parameters<NonNullable<PanelDeps['captchaAssist']>['submitClick']>[0];
+    }>(automationHttp),
+    preflightApprovePublish: (requestId) =>
+      new PanelPublishPreflightHttpClient<
+        Awaited<ReturnType<NonNullable<PanelDeps['preflightApprovePublish']>>>
+      >(automationHttp).preflight(requestId),
     // 上传单独走放宽超时的那条连接：大载荷传输 + 属主侧逐张落库，默认 15s 必然不够，
     // 而超时后属主侧很可能**已经写完了** —— 那是「看起来失败其实成功」，比失败难查得多。
     facebookPublishMedia: new PanelFacebookMediaHttpClient(
@@ -2469,13 +2493,9 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
   // 这张表只准缩短；每条写清「为什么不装 + 管理后台上的表现」。
   // 少写一项、或装上了却忘了删条目，下面那句断言会让进程起不来。
   const panelCapabilityAbsences: PanelCapabilityAbsences = {
-    captchaAssist:
-      '验证码协助的现场（阻断快照 / 截图 / 点击回放）在自动化进程的边缘接入层，本进程没有；'
-      + '后台「验证码协助」页整页不可用。跨进程窄口见 change restore-panel-capability-wiring 批次 4。',
     curatedActions:
       '行级动作要发起发布管线（内容域的并行洗稿准入）与定向评论调度（自动化域），'
       + '两个域都不在本进程；后台精选库行内两个按钮不可用。批次 4。',
-    preflightApprovePublish: '授权前置校验在自动化进程。批次 4。',
     publishDispatcher: '下发在途记录号在自动化进程；面板已有同步读镜像兜住在途证据。批次 4。',
     rolePromptPreview:
       '角色提示词预览要同时用到自动化域的预览调度器与内容域的渲染闭包表，'
