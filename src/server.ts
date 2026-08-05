@@ -217,6 +217,7 @@ import { CategoryConfigStore } from './config/category-config-store.js';
 import { CredentialStore } from './config/credential-store.js';
 import { ModelConfigStore } from './config/model-config-store.js';
 import { MirrorVersionStore } from './config/mirror-version-store.js';
+import { ConfigMirrorRefresher } from './config/mirror-refresher.js';
 import { PgConfigMirrorBumpSink } from './config/mirror-bump-sink.js';
 import { RoleConfigStore } from './config/role-config-store.js';
 import { ROLE_CATALOG, categoryOf, type ThinkingMode } from './config/role-catalog.js';
@@ -717,6 +718,11 @@ interface ApiCompositionRoot {
     publishUi: PublishUiUpdateCommandPort;
     personaGenerator: PersonaGeneratorAuthorityPort;
   };
+  /**
+   * 跨运行目标的配置可见性（change unify-facebook-global-policy-across-targets）。
+   * 挂在组装根上只为**关停时能停掉它**；它不是取值口，业务侧一律照旧问各自的存储。
+   */
+  configMirrorRefresher: ConfigMirrorRefresher;
   syncRead: {
     ownerSource: ApiSyncReadSnapshotSource;
     consumer: ApiSyncReadConsumerRuntime;
@@ -1460,6 +1466,51 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
   ]);
   const accountState = new AccountStateManager(accountStore);
   await accountState.init();
+
+  // ── 跨运行目标的配置可见性（change unify-facebook-global-policy-across-targets task 3.6）──
+  //
+  // Facebook 全局运营策略与冷启动完成事实已收成**跨全部运行目标唯一一份**。于是本进程第一次
+  // 有了「另一个接口进程会改我正在用的那份配置」这种事——dev 那台后台按下保存，本进程必须看到。
+  //
+  // 合并前不需要这条通道：每张配置表只有一个进程在写，它自己的缓存永远是对的。
+  //
+  // **MUST NOT 依赖那条顺带刷新的副作用**：本进程唯一一处重读这些表的地方在属主快照闭包里，
+  // 只有自动化进程过来拉那条流时才跑——节奏由**对方**决定。对方哪天改了拉取节奏、或那条流改成
+  // 「变更才拉」，本进程就会**永远**读旧值：不报错、无日志、只有把两个后台逐格比对才能发现，
+  // 正是本 change 要消灭的那个形状换个位置复发。
+  //
+  // 窄装：只挂这三个键的重载器，**不**把它注册成新鲜度事实源、**不**接停手闸、**不**发陈旧告警。
+  // 那些是自动化进程侧的既有职责，在这里一并打开等于顺手改了本进程的停手语义。
+  const configMirrorRefresher = new ConfigMirrorRefresher({
+    pool,
+    versionStore: mirrorVersionStore,
+    executionTarget: target,
+    reloaders: {
+      // 三张表的写各自推哪些键，以属主存储里的 bumpInTx 为准；这里按「谁被推了就重载谁」登记，
+      // MUST NOT 只挂 facebook_operation_policy 一个——群评论策略的写只推 content_schedule。
+      facebook_operation_policy: () => facebookOperationPolicy.refreshFromAuthority(),
+      content_schedule: async () => {
+        await Promise.all([
+          contentSchedule.refreshFromAuthority(),
+          facebookOperationPolicy.refreshFromAuthority(),
+          facebookGroupCommentPolicyStore.refreshFromAuthority(),
+        ]);
+      },
+      client_environment_slow_start: () => clientUserStore.refreshSlowStartFromAuthority(),
+    },
+  });
+  try {
+    await configMirrorRefresher.start();
+  } catch (error) {
+    // 周期配置非法这类错误 MUST 诚实报出，但 MUST NOT 让整个接口进程起不来：
+    // 不启动刷新器 = 退回本 change 之前的可见性（本进程写入即刷新、别人的写要等下一次快照拉取），
+    // 那是**降级**不是正确，故这里必须留下响亮的一行，不能只 catch 掉。
+    console.error(
+      `[aidcp-api] 配置镜像刷新器未启动，另一运行目标的配置改动本进程可能长时间读不到：${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  }
 
   // ── content 进程要用、事实源在本域的两条窄口 ──────────────────────────────────────────
   // 解析逻辑**只此一份**：四层回落（per-role → 分类 → 全局 → 代码默认）在属主侧算完再送快照，
@@ -2865,6 +2916,7 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
 
   return {
     target,
+    configMirrorRefresher,
     pool,
     authorities,
     apiFeishu,
@@ -3221,6 +3273,7 @@ export async function startApiService(options: {
     closing = true;
     closePromise = (async () => {
       root.syncRead.consumer.stop();
+      root.configMirrorRefresher.stop();
       const activeBusinessStart = businessStart;
       if (activeBusinessStart) {
         await activeBusinessStart.catch(() => undefined);
