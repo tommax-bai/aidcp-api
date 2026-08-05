@@ -2007,6 +2007,11 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
         slowStart: facebookOperationPolicy.slowStartRuntimePolicy(),
       };
     },
+    // 群评论时序策略随 `content_schedule` 流发给自动化进程（那条流的游标本就覆盖它：
+    // 这份策略落库时 bump 的就是同一个 mirror key）。**同步取**：该存储是「启动期刷一次 +
+    // 写入后自刷」的内存形态，这里再 await 一次只会读到一半的写。
+    // 未就绪时 `get()` 返回 null，原样透出——消费方据此报具名不可用，绝不顶默认时长。
+    facebookGroupCommentPolicy: () => facebookGroupCommentPolicyStore.get(),
   });
   const syncReadMirrors = new ApiSyncReadMirrors(target);
   // 兑现上面那条惰性引用（内容排期存储要读全局周活跃掩码）。
