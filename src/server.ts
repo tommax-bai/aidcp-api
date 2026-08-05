@@ -94,6 +94,7 @@ import {
   resolvePlatformCredentialEnvValue,
 } from './config/platform-credentials.js';
 import { createRoleConfigPanel } from './config/role-config-facade.js';
+import { createRolePromptProvider } from './config/role-prompt-preview.js';
 import { createCategoryConfigPanel } from './config/category-config-facade.js';
 import { HotLeadConfigStore } from './config/hot-lead-config-store.js';
 import { createHotLeadConfigPanel } from './config/hot-lead-config-facade.js';
@@ -2427,6 +2428,25 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
     facebookGroupCommentPolicy: facebookGroupCommentPolicyStore,
     interactionPermissions: { getView: () => interactionPermissionOverview },
 
+    // 角色提示词预览（change restore-panel-capability-wiring 批次 7）。
+    // **本进程只提供它能诚实提供的那一半**：18 个静态预览（收件箱 / 评论 / 判定等）在本仓
+    // 就地渲染；浏览角色的渲染实例在自动化进程、发布与配图的渲染闭包表在内容进程，
+    // 本进程不复制它们（复制就是第二份实现，与正本的漂移在行为测试上原理不可见）。
+    //
+    // 那些角色回 `available:false` **并带上说清位置的 note**：不带的话它们会落到
+    // 「该角色暂不支持预览」——那句话是错的，会让运营以为是产品限制而不是部署形态，
+    // 于是这个缺口永远不会被报上来。整页 503 与「半页能看 + 另一半说清原因」之间，
+    // 后者才是诚实回执。剩下那一半已登记 backlog。
+    //
+    // **有意不注入账号口径**（withAccount / getPersona）：账号维度那条分支在没有真 persona
+    // 解析器时会把示例人设标成「所选账号人设」——一个假标签，比不提供该维度糟得多。
+    // 不注入时全部走示例人设分支，标注逐字诚实。账号口径的预览随浏览角色那半一起补。
+    rolePromptPreview: createRolePromptProvider(() => [], {
+      rendererElsewhereNote:
+        '该角色的提示词渲染器不在管理后台后端所在的进程里（浏览角色在自动化进程、'
+        + '发布与配图在内容进程）——不是「不支持预览」。',
+    }),
+
     // ── change restore-panel-capability-wiring 批次 3：事实源在内容进程的三族 ────────
     // 后台「用量成本」「精选库」「FB 发帖图片」三处此前整块 503。
     // 账号隔离仍由属主侧那段 SQL 保证（`account_id` 进 WHERE），不靠调用方自觉。
@@ -2497,9 +2517,6 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
       '行级动作要发起发布管线（内容域的并行洗稿准入）与定向评论调度（自动化域），'
       + '两个域都不在本进程；后台精选库行内两个按钮不可用。批次 4。',
     publishDispatcher: '下发在途记录号在自动化进程；面板已有同步读镜像兜住在途证据。批次 4。',
-    rolePromptPreview:
-      '角色提示词预览要同时用到自动化域的预览调度器与内容域的渲染闭包表，'
-      + '本进程只有人设那一段；后台角色页的「查看提示词」不可用。批次 7。',
     interactionInternalApi: '视频号内部配置 API 由客户端鉴权面单独承载，面板不复用这一族。',
     configMirrorHealth:
       '旧版单服务镜像健康视图；本进程改用按服务分域的 configMirrorServicesHealth，'
