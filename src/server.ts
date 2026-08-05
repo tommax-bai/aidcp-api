@@ -1432,7 +1432,6 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
   // 否则一次拆进程会把运营早先配的窗口悄悄改回默认）。
   const facebookGroupCommentPolicyStore = new FacebookGroupCommentPolicyStore({
     pool,
-    executionTarget: target,
     schemaProber: probeSchemaShape,
     mirrorVersionBumper: mirrorVersionStore,
     legacyWarmupHours: () => process.env.AIDCP_FB_GROUP_COVERAGE_WARMUP_HOURS,
