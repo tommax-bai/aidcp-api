@@ -24,6 +24,7 @@ import type {
   SessionLimitPatchInput,
   HotLeadConfigPatchInput,
   ResumeConfigPatchInput,
+  RestrictedPolicyPatchInput,
   DashboardSummary,
   PanelConfigMirrorHealthResponse,
   PanelEvidenceState,
@@ -3503,6 +3504,55 @@ function createRequestHandler(
         patch[k] = v;
       }
       const result = await deps.resumeConfig.set(patch, verified.payload.sub);
+      if (!result.ok) {
+        sendJson(res, 400, { error: result.reason });
+        return;
+      }
+      sendJson(res, 200, result.view);
+      return;
+    }
+
+    // ── 受限处置策略（全局单例，change restricted-policy-global-config）──────────
+    // append 链。写非乐观回真态；未知模式 / 非正整数小时整块拒（invalid_value→400）；
+    // 只写 restricted_policy_config（automation 属主，经内部 HTTP 透传），不碰风控状态单写路径。
+    if (method === 'GET' && url === '/api/restricted-policy') {
+      if (!deps.restrictedPolicy) {
+        sendJson(res, 503, { error: 'restricted_policy_unavailable' });
+        return;
+      }
+      sendJson(res, 200, await deps.restrictedPolicy.getView());
+      return;
+    }
+    if (method === 'PUT' && url === '/api/restricted-policy') {
+      if (!deps.restrictedPolicy) {
+        sendJson(res, 503, { error: 'restricted_policy_unavailable' });
+        return;
+      }
+      let body: unknown;
+      try {
+        body = await readJsonBody(req);
+      } catch {
+        sendJson(res, 400, { error: 'bad_request' });
+        return;
+      }
+      const raw = (body ?? {}) as Record<string, unknown>;
+      const patch: RestrictedPolicyPatchInput = {};
+      if (raw.mode !== undefined) {
+        // 枚举取值交 owner 侧 facade 判（未知模式 → invalid_value）；这里只拦类型错。
+        if (typeof raw.mode !== 'string') {
+          sendJson(res, 400, { error: 'bad_request', reason: 'value_type' });
+          return;
+        }
+        patch.mode = raw.mode as RestrictedPolicyPatchInput['mode'];
+      }
+      if (raw.recoveryHours !== undefined) {
+        if (typeof raw.recoveryHours !== 'number') {
+          sendJson(res, 400, { error: 'bad_request', reason: 'value_type' });
+          return;
+        }
+        patch.recoveryHours = raw.recoveryHours;
+      }
+      const result = await deps.restrictedPolicy.set(patch, verified.payload.sub);
       if (!result.ok) {
         sendJson(res, 400, { error: result.reason });
         return;

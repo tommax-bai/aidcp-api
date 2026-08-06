@@ -53,6 +53,7 @@ export const PANEL_CAPABILITY_KEYS = [
   'sessionLimits',
   'hotLeadConfig',
   'resumeConfig',
+  'restrictedPolicy',
   'tokenUsage',
   'billingPriceRefresh',
   'notificationContact',

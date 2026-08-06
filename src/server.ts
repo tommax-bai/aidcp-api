@@ -286,6 +286,7 @@ import {
   PanelQuotaConfigHttpClient,
   PanelPacingConfigHttpClient,
   PanelSessionLimitsHttpClient,
+  PanelRestrictedPolicyHttpClient,
   PanelResumeConfigHttpClient,
 } from 'aidcp-transport/transport/panel-config-http.js';
 import { registerPanelEventDeliveryRoutes } from 'aidcp-transport/transport/panel-event-delivery-http.js';
@@ -2529,6 +2530,7 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
     pacingConfig: new PanelPacingConfigHttpClient(automationHttp),
     sessionLimits: new PanelSessionLimitsHttpClient(automationHttp),
     resumeConfig: new PanelResumeConfigHttpClient(automationHttp),
+    restrictedPolicy: new PanelRestrictedPolicyHttpClient(automationHttp),
 
     // ── change restore-panel-capability-wiring：本域属主、此前一项都没装上的六项 ──────
     // 它们全部只读写本进程属主的配置表，不经任何跨进程通道。

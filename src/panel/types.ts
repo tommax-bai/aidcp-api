@@ -83,6 +83,7 @@ import type {
   PacingConfigSetResult,
   PanelPacingConfig,
   PanelQuotaConfig,
+  PanelRestrictedPolicy,
   PanelResumeConfig,
   PanelSessionLimits,
   QuotaConfigCatalogView,
@@ -90,6 +91,9 @@ import type {
   QuotaConfigRowView,
   QuotaConfigSetResult,
   ResumeConfigPatchInput,
+  RestrictedPolicyPatchInput,
+  RestrictedPolicySetResult,
+  RestrictedPolicyView,
   ResumeConfigSetResult,
   ResumeConfigView,
   SessionLimitPatchInput,
@@ -452,6 +456,12 @@ export interface PanelDeps {
    * 只动 resume_config_global，不碰风控状态单写路径、不经协议。
    */
   resumeConfig?: PanelResumeConfig;
+  /**
+   * 受限处置策略（全局单例，change restricted-policy-global-config）。未注入则 /api/restricted-policy 返回 503。
+   * 模式（browse_only 只浏览 / full_pause 浏览也暂停）+ 恢复时长 N 小时；写非乐观回真态；
+   * 非法值整块拒；只动 restricted_policy_config（automation 属主，经内部 HTTP 透传），不碰风控状态单写路径。
+   */
+  restrictedPolicy?: PanelRestrictedPolicy;
   /**
    * token 用量只读查询（change llm-token-usage-stats）。未注入则 /api/llm-usage 返回 503。
    * 纯只读预聚合表（按账号/角色/模型/10 分钟桶）；缺表回落空；不写、不碰风控/发布/edge。
@@ -970,6 +980,7 @@ export type {
   PacingConfigSetResult,
   PanelPacingConfig,
   PanelQuotaConfig,
+  PanelRestrictedPolicy,
   PanelResumeConfig,
   PanelSessionLimits,
   QuotaConfigCatalogView,
@@ -977,6 +988,9 @@ export type {
   QuotaConfigRowView,
   QuotaConfigSetResult,
   ResumeConfigPatchInput,
+  RestrictedPolicyPatchInput,
+  RestrictedPolicySetResult,
+  RestrictedPolicyView,
   ResumeConfigSetResult,
   ResumeConfigView,
   SessionLimitPatchInput,

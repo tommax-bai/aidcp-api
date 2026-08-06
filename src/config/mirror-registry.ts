@@ -3,7 +3,7 @@
  *
  * ## 这张表要解决的问题
  *
- * 云端有 15 处进程内配置镜像，全部只在 `init()` 与**本进程写入**时刷新——全仓无 watch、无
+ * 云端有 16 处进程内配置镜像，全部只在 `init()` 与**本进程写入**时刷新——全仓无 watch、无
  * `setInterval` 刷配置、无 `LISTEN/NOTIFY`。dev 与 ol 是两个进程共用同一个 PostgreSQL 库，
  * 其中 8 张是无 `execution_target` 列的全局配置表：在 dev 控制台改一个全局安全限额，ol 进程的
  * 镜像**到重启才可见**，中间零日志、零告警、后台还回显写入成功。拆成三服务后，同一缺陷会从
@@ -82,7 +82,7 @@ export type ConfigMirrorDescriptor = GateConfigMirrorDescriptor | ParameterConfi
 export const DEFAULT_GATE_STALE_MS = 60_000;
 
 /**
- * 15 处镜像的穷举登记表。**新增镜像未登记即 typecheck 失败。**
+ * 16 处镜像的穷举登记表。**新增镜像未登记即 typecheck 失败。**
  *
  * 映射类型 `{ [K in ConfigMirrorKey]: … & { mirrorKey: K } }` 额外保证「键与 `mirrorKey` 字段一致」，
  * 复制粘贴改错 key 也会当场报错。
@@ -124,6 +124,18 @@ export const CONFIG_MIRRORS: {
     consumers: ['automation'],
     source: 'resume_config_global',
     holder: 'src/config/resume-config-store.ts',
+    tier: 'parameter',
+    staleMs: null,
+  },
+  // 受限处置策略（change restricted-policy-global-config）：与四类限频配置同形——
+  // automation 属主、写入方与消费方（风控判定）同进程，本地写透镜像、无跨服务副本，
+  // 故按头注判据登记 parameter；判定层缺值逐项回落写死默认（browse_only / 72h），never-brick。
+  restricted_policy_config: {
+    mirrorKey: 'restricted_policy_config',
+    owner: 'automation',
+    consumers: ['automation'],
+    source: 'restricted_policy_config',
+    holder: 'src/config/restricted-policy-store.ts',
     tier: 'parameter',
     staleMs: null,
   },
