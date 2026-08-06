@@ -442,14 +442,36 @@ test('4b API package graph has one exact kernel and transport instance', async (
   ) as {
     packages: Record<string, {
       dependencies?: Record<string, string>;
+      resolved?: string;
     }>;
   };
   const root = lock.packages['']?.dependencies ?? {};
-  assert.match(root['aidcp-kernel'] ?? '', /#[0-9a-f]{40}$/);
-  assert.match(root['aidcp-transport'] ?? '', /#[0-9a-f]{40}$/);
-  assert.equal(
-    lock.packages['node_modules/aidcp-transport']?.dependencies?.['aidcp-kernel'],
-    root['aidcp-kernel'],
+  // Canonical pin form since invert-split-fact-source §2: git+ssh URL pinned at a version tag.
+  const canonicalPin =
+    /^git\+ssh:\/\/git@github\.com\/tommax-bai\/aidcp-(?:kernel|transport)\.git#v\d+\.\d+\.\d+$/;
+  assert.match(root['aidcp-kernel'] ?? '', canonicalPin);
+  assert.match(root['aidcp-transport'] ?? '', canonicalPin);
+  // The lockfile must have resolved each tag pin down to an exact commit sha.
+  const kernelResolvedSha =
+    lock.packages['node_modules/aidcp-kernel']?.resolved?.split('#').pop() ?? '';
+  const transportResolvedSha =
+    lock.packages['node_modules/aidcp-transport']?.resolved?.split('#').pop() ?? '';
+  assert.match(kernelResolvedSha, /^[0-9a-f]{40}$/);
+  assert.match(transportResolvedSha, /^[0-9a-f]{40}$/);
+  // Transport's own kernel requirement must land on the very same commit the root kernel
+  // resolved to — same content even when the pin spelling differs (tag vs raw sha).
+  const transportKernelRef =
+    lock.packages['node_modules/aidcp-transport']?.dependencies?.['aidcp-kernel']
+      ?.split('#').pop() ?? '';
+  if (/^[0-9a-f]{40}$/.test(transportKernelRef)) {
+    assert.equal(transportKernelRef, kernelResolvedSha);
+  }
+  // Exactly one installed instance of each shared package: if transport's kernel requirement
+  // could not dedupe onto the root kernel, npm would nest a divergent copy and this goes red.
+  assert.deepEqual(
+    Object.keys(lock.packages).filter((key) =>
+      /(?:^|\/)node_modules\/aidcp-kernel$/.test(key)),
+    ['node_modules/aidcp-kernel'],
   );
   assert.deepEqual(
     Object.keys(lock.packages).filter((key) =>

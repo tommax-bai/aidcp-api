@@ -46,12 +46,31 @@ test('api server and transport resolve one exact kernel catalog pin', async () =
       string,
       {
         dependencies?: Record<string, string>;
+        resolved?: string;
       }
     >;
   };
+  // Canonical pin form since invert-split-fact-source §2: git+ssh URL pinned at a version tag,
+  // which the lockfile resolves to an exact commit sha.
   const directKernel = lock.packages[''].dependencies?.['aidcp-kernel'];
-  const transportKernel =
-    lock.packages['node_modules/aidcp-transport'].dependencies?.['aidcp-kernel'];
-  assert.match(directKernel ?? '', /#[0-9a-f]{40}$/);
-  assert.equal(transportKernel, directKernel);
+  assert.match(
+    directKernel ?? '',
+    /^git\+ssh:\/\/git@github\.com\/tommax-bai\/aidcp-kernel\.git#v\d+\.\d+\.\d+$/,
+  );
+  const kernelResolvedSha =
+    lock.packages['node_modules/aidcp-kernel']?.resolved?.split('#').pop() ?? '';
+  assert.match(kernelResolvedSha, /^[0-9a-f]{40}$/);
+  // Transport's own kernel requirement must land on that same commit (same catalog content,
+  // even when the pin spelling differs: tag vs raw sha), and dedupe to one installed instance.
+  const transportKernelRef =
+    lock.packages['node_modules/aidcp-transport']?.dependencies?.['aidcp-kernel']
+      ?.split('#').pop() ?? '';
+  if (/^[0-9a-f]{40}$/.test(transportKernelRef)) {
+    assert.equal(transportKernelRef, kernelResolvedSha);
+  }
+  assert.deepEqual(
+    Object.keys(lock.packages).filter((key) =>
+      /(?:^|\/)node_modules\/aidcp-kernel$/.test(key)),
+    ['node_modules/aidcp-kernel'],
+  );
 });
