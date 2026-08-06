@@ -1353,6 +1353,11 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
     versionStore: mirrorVersionStore,
     logger: console,
   });
+  /**
+   * 运行策略存储建在本行之下（它要先有 schema 探针），而客户存储要的那格回调必须在这里交出去
+   * ⇒ 惰性引用，与本文件里 `syncReadMirrorsRef` 同范式。**未赋值即抛**，绝不静默跳过刷新。
+   */
+  let facebookOperationPolicyRef: FacebookOperationPolicyStore | null = null;
   const clientUserStore = new ClientUserStore({
     pool,
     mirrorVersionBumper: mirrorVersionStore,
@@ -1360,6 +1365,25 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
     // 不注入时那个端口是「当场抛」的形态 —— 表现不是某个字段为空，而是
     // 管理后台的环境页整页 500（2026-08-04 切流当天实测）。
     automationReads: new ClientEnvAutomationHttpClient(automationHttp),
+    // 建号 / 导入落库提交后，**同进程**那份运行策略副本必须当场重装。
+    //
+    // 不接这一格不报错也不告警：缺省实现（`client-user-store.ts` 的
+    // `refreshFacebookOperationPolicyAfterProvisioning`）在端口缺席时直接返回「刷新成功」。
+    // 于是新环境的主浏览入口只能等配置镜像那条 5 秒轮询兜底收进副本，而副本没收进去时
+    // 「这个环境按什么方式跑」一律答 `facebook_operation_policy_unavailable`(503)——
+    // 客户端恰恰是在建号回执落地的那一刻就去问的，必落在窗口里；且它把这次失败按环境钉死、
+    // 不再重取，于是那行错误一直挂到重启客户端为止。单体在同一格接着
+    // （cloud@2d34e06^ `src/server.ts:2630`），拆仓写本 main 时掉了。
+    // 2026-08-06 dev 实测：yn50 批量导入 50 个 Facebook 环境，全部复现。
+    refreshFacebookOperationPolicyAuthority: async () => {
+      if (!facebookOperationPolicyRef) {
+        // 到不了这里（provisioning 只在服务起完之后发生）；真到了也必须响亮——
+        // 抛出去会让完成端点诚实回 `operation_policy_refresh_unavailable`，
+        // 而不是把「副本没刷新」当成刷新成功。
+        throw new Error('facebook_operation_policy_store_not_constructed');
+      }
+      await facebookOperationPolicyRef.refreshFromAuthority();
+    },
     executionTarget: target,
     schemaEnsurer: migrationManagedSchema,
   });
@@ -1441,6 +1465,8 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
     // 判定取共享实现，**MUST NOT 在本仓重写一份**。
     environmentSlowStartResolver: async (input) => resolveEnvironmentSlowStartState(input),
   });
+  // 上面那格惰性引用的赋值点：客户存储的「落库后刷新运行策略副本」回调靠它落地。
+  facebookOperationPolicyRef = facebookOperationPolicy;
   /**
    * Facebook 自动加群的每账号配置。**本进程此前不构造它**，而排期器的独立加群动作
    * 三道闸（开关 / 日上限 / 时段）全读它——不注入即整个加群动作静默跳过。
