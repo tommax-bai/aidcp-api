@@ -30,6 +30,8 @@ import { fileURLToPath } from 'node:url';
 import type { PgOwner } from 'aidcp-kernel/kernel/pg-owner-connection-resolver.js';
 import { loadMigrationFiles } from 'aidcp-transport/schema/migration-files.js';
 import {
+  LEGACY_OWNER_OVERRIDES_NAME,
+  loadLegacyOwnerOverrides,
   loadMigrationOwnerScopes,
   loadTableOwnership,
   type MigrationOwnerScopes,
@@ -96,6 +98,10 @@ export async function runApiStartupSchemaGate(options?: {
         loadMigrationOwnerScopes(
           () => loadMigrationFiles(path.join(REPO_ROOT, 'migrations')),
           () => loadTableOwnership(path.join(REPO_ROOT, 'boundaries', 'table-ownership.json')),
+          // 第三个输入与前两个同理、同一个坑：历史迁移执行范围的封闭名册也住在本仓 migrations/ 下，
+          // 而这份实现来自共享包，它的默认基准指向**包自己的目录**。漏传的后果不是编译错——
+          // 是启动时读不到名册 ⇒ 13 条历史迁移判不出执行范围 ⇒ 门判「判据不可用」拒绝启动。
+          () => loadLegacyOwnerOverrides(path.join(REPO_ROOT, 'migrations', LEGACY_OWNER_OVERRIDES_NAME)),
         )),
     // 日志前缀：不传的话打出来的是 `[aidcp-cloud]`（这份实现的事实源在单体）。
     // 门拒绝启动时这条日志是 journal 里唯一的线索，打成别的服务名会把排查直接引偏。
