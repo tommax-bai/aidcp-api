@@ -259,6 +259,7 @@ import {
 } from './client-auth/client-auth-server.js';
 import { LoginRateLimiter } from './client-auth/rate-limiter.js';
 import { PanelAutomationHttpClient } from 'aidcp-transport/transport/panel-automation-http.js';
+import { HostStandbyDecisionHttpClient } from 'aidcp-transport/transport/host-standby-decision-http.js';
 import { PublishStatusHttpClient } from 'aidcp-transport/transport/publish-status-http.js';
 import { RiskCommandHttpClient } from 'aidcp-transport/transport/risk-command-http.js';
 import { RiskReadHttpClient } from 'aidcp-transport/transport/risk-read-http.js';
@@ -2283,6 +2284,17 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
   /** 客户提交离场后的即时派发触发。目标边缘由属主进程解析，本进程只给 accountId。 */
   const interactionOffboard = new InteractionOffboardHttpClient(automationHttp);
   const panelStore = new PgPanelStore({ pool, automation: new PanelAutomationHttpClient(automationHttp) });
+  /**
+   * 宿主层让位判决遥测的**只读**取用（change report-host-standby-decisions）。
+   *
+   * 事实在自动化进程（边缘回执只到那条 WebSocket），本进程只能问过来。
+   * 运营据此在这里看出「哪台机器上的哪个环境卡了多久」——本地留痕只服务坐在那台机器前的人，
+   * 而车队是跨机器的。
+   *
+   * ⚠️ **只读**：它 MUST NOT 被接进任何下发路径。云端读得到，但 MUST NOT 据此否决宿主层的
+   * 槽位判决——槽位不跨机器，调度权在宿主层，可见性是那份决策权的对价、不是审批权。
+   */
+  const hostStandbyDecisions = new HostStandbyDecisionHttpClient(automationHttp);
 
   // ── 面板配置外观（change restore-panel-capability-wiring）──────────────────────────
   //
@@ -2379,6 +2391,7 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
     parseInteractionPanelGrants(process.env.AIDCP_INTERACTION_PANEL_GRANTS),
   );
   const panelDeps: PanelDeps = {
+    hostStandbyDecisions,
     publishLogStore,
     botChatStore: apiFeishu.botChatStore,
     eventBus: panelEventFanout,
