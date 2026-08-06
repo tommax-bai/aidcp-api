@@ -176,6 +176,8 @@ import { registerImageModelSelectionRoutes } from 'aidcp-transport/transport/ima
 import { registerAccountPlatformRoutes } from 'aidcp-transport/transport/account-platform-http.js';
 import { registerConfigMirrorBumpRoutes } from 'aidcp-transport/transport/config-mirror-bump-http.js';
 import { ClientEnvAutomationHttpClient } from 'aidcp-transport/transport/client-env-automation-http.js';
+import { OffboardMaterializationHttpClient } from 'aidcp-transport/transport/offboard-materialization-http.js';
+import { OffboardCleanupGrantHttpClient } from 'aidcp-transport/transport/offboard-cleanup-grant-http.js';
 import type { ReviewCardDeliveryPort } from 'aidcp-kernel/kernel/review-card-delivery-port.js';
 import type { PublishLogWriter } from 'aidcp-kernel/kernel/publish-log-writer-port.js';
 import type { PipelineLogSink } from 'aidcp-kernel/kernel/pipeline-log-contract.js';
@@ -1365,6 +1367,17 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
     // 不注入时那个端口是「当场抛」的形态 —— 表现不是某个字段为空，而是
     // 管理后台的环境页整页 500（2026-08-04 切流当天实测）。
     automationReads: new ClientEnvAutomationHttpClient(automationHttp),
+    // 离场链上的两个**写**端口：与上面那个读端口同属一域、同一条 HTTP 出口。
+    //
+    // 此前本进程一个都没接，两种缺席形态各不相同、都不是「少个字段」：
+    //   - 台账物化：调用点把异常收进 try/catch ⇒ **每一次删环境**都退成「已受理、等对账」。
+    //     那条降级路径本身是设计好的（对账循环会捡回去物化），所以它不报错也不告警，
+    //     只是永远慢一拍，且只要对账那一轮没跑到就一直停在「已受理」。
+    //   - 清理授权签发 / 烧票：调用点没有兜底 ⇒ 直接 500，客户端拿不到清理票。
+    // 属主侧两个实现都自开事务、跑 automation 自己的池（kernel 端口的硬约束：不接调用方事务句柄），
+    // 所以这里只是把同一个端口换成 HTTP 客户端，调用点一行不改。
+    offboardMaterialization: new OffboardMaterializationHttpClient(automationHttp),
+    cleanupGrantOps: new OffboardCleanupGrantHttpClient(automationHttp),
     // 建号 / 导入落库提交后，**同进程**那份运行策略副本必须当场重装。
     //
     // 不接这一格不报错也不告警：缺省实现（`client-user-store.ts` 的
