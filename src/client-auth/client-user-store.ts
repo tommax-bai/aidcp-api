@@ -2078,7 +2078,7 @@ export class ClientUserStore {
       if (platform === 'facebook') {
         const baseMode: FacebookBaseOperationMode =
           resolvedFacebookOperationMode === 'slow_start'
-            ? 'persona'
+            ? 'consumption'
             : resolvedFacebookOperationMode;
         const revisionResult = await client.query<{ revision: number | string }>(
           `SELECT nextval('facebook_operation_policy_revision_seq') AS revision`,

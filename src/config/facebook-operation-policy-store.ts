@@ -1522,8 +1522,10 @@ export class FacebookOperationPolicyStore {
           : input.mode === 'consumption' && input.consumption
             ? input.consumption
             : current.consumption;
+      // 慢启动的可恢复基础模式默认消费：毕业后不依赖人设绑定即可继续运转
+      // （change default-consumption-after-slow-start）。
       const nextBaseMode: FacebookBaseOperationMode =
-        input.mode === 'slow_start' ? 'persona' : input.mode;
+        input.mode === 'slow_start' ? 'consumption' : input.mode;
       const shouldResetSlowStart = input.mode === 'slow_start'
         && (
           environment.slow_start_since == null
