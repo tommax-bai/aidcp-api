@@ -894,6 +894,27 @@ function deploymentTarget(): DeploymentTarget {
   return target;
 }
 
+/**
+ * 风控端口那三处 `catch → null` 的日志文案。返回值只进日志，**绝不进响应**
+ * （对外仍是那一句可降级的 503，见调用点注释）。
+ *
+ * 尽力把内部 HTTP 的具名错误码带出来：`risk_command_target_unavailable`（属主进程没接到本机 target）、
+ * `risk_command_target_mismatch`（跨环境）、`timeout` / `transport_error`（对面没起来）在运维那一侧
+ * 是完全不同的三件事，塌成一句「读不到」就得靠人去猜。
+ *
+ * **用结构化守卫、不用 `instanceof`**：这个错误可能由另一份同名类构造（同一进程两份运行时拷贝时
+ * `instanceof` 恒 false），而那正好会让本函数在最需要它的时候退化成裸 message。
+ */
+function describeRiskPortFailure(err: unknown): string {
+  if (typeof err === 'object' && err !== null) {
+    const e = err as { name?: unknown; code?: unknown; message?: unknown };
+    if (e.name === 'InternalHttpError' && typeof e.code === 'string') {
+      return `${e.code}: ${typeof e.message === 'string' ? e.message : ''}`;
+    }
+  }
+  return err instanceof Error ? err.message : String(err);
+}
+
 function requiredSchemaObjects(ddl: readonly string[]): {
   tables: Map<string, Set<string>>;
   indexes: Set<string>;
@@ -2799,20 +2820,34 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
     //
     // 三处 `catch → null` 逐字照单体：调用方把 null 读作「这项暂时给不出」，
     // 而不是「该账号没有风控状态」。**MUST NOT 改成抛**——它在客户端上是一块可降级的展示。
+    //
+    // 但**吞掉异常 ≠ 吞掉证据**：这三处此前连一行日志都不打，而下游把三种 null 压成同一句
+    // 503 `environment_risk_unavailable`。2026-08-04 automation 侧漏接本机 target 之后，
+    // 客户自助解除受限 100% 失败了近一周，ECS 日志上一个字都没有 —— 唯一的现象是
+    // 「客户端那个按钮点了没反应」。所以每处都留下**是哪一步、什么错**。
     environmentRisk: {
       platformForAccount: (accountId) => accountStore.platformFor?.(accountId),
       viewForAccount: async (accountId) => {
         try {
           const state = await riskRead.getState(accountId);
           return { status: state.status, statusSince: state.statusSince, updatedAt: state.updatedAt };
-        } catch {
+        } catch (err) {
+          console.warn(
+            `[aidcp-api] 风控状态读取失败（客户端将见 503 environment_risk_unavailable）account=${accountId}: `
+              + describeRiskPortFailure(err),
+          );
           return null;
         }
       },
       submitRestrictedRecovery: async (envKey, accountId, reason, requestedBy) => {
         try {
           return await riskCommands.submitRestrictedRecovery({ envKey, accountId, reason, requestedBy });
-        } catch {
+        } catch (err) {
+          // 这一条是**写命令被拒**，与上面那条「读不到」在客户端上同形、在这里必须分得开。
+          console.warn(
+            `[aidcp-api] 受限恢复命令提交失败（客户端将见 503 environment_risk_unavailable）`
+              + `env=${envKey} account=${accountId}: ${describeRiskPortFailure(err)}`,
+          );
           return null;
         }
       },
@@ -2844,7 +2879,12 @@ async function buildApiCompositionRoot(): Promise<ApiCompositionRoot> {
               updatedAt: risk.updatedAt,
             },
           };
-        } catch {
+        } catch (err) {
+          // 回读失败与「提交失败」必须分得开：命令**可能已经受理**，这里只是核不到结果。
+          console.warn(
+            `[aidcp-api] 受限恢复结果回读失败（客户端将见 503 environment_risk_unavailable）`
+              + `command=${commandId} env=${envKey} account=${accountId}: ${describeRiskPortFailure(err)}`,
+          );
           return null;
         }
       },
