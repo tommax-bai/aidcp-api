@@ -24,6 +24,7 @@ interface PolicyRow {
 
 interface GlobalPolicyRow {
   singleton: boolean;
+  cadence_mode: string;
   persona_reel_views_per_like: number;
   persona_reel_views_per_follow: number;
   slow_start_reel_views_per_like: number;
@@ -95,6 +96,7 @@ function readySchema(withGlobal = false): SchemaProber {
       'facebook_primary_browse_surface_policy_audit.created_at',
       ...(withGlobal ? [
         'facebook_operation_global_policy.singleton',
+        'facebook_operation_global_policy.cadence_mode',
         'facebook_operation_global_policy.persona_reel_views_per_like',
         'facebook_operation_global_policy.persona_reel_views_per_follow',
         'facebook_operation_global_policy.slow_start_reel_views_per_like',
@@ -185,6 +187,7 @@ function database(options: { executionTarget?: 'dev' | 'ol' } = {}) {
   let globalRow: GlobalPolicyRow = {
     // 收缩之后表上没有任何选行维度了：单例主键使第二行插不进去，读路径直取那一行。
     singleton: true,
+    cadence_mode: 'fixed',
     persona_reel_views_per_like: 4,
     persona_reel_views_per_follow: 10,
     slow_start_reel_views_per_like: 15,
@@ -223,7 +226,7 @@ function database(options: { executionTarget?: 'dev' | 'ol' } = {}) {
 
   const query = async (text: string, params: unknown[] = []) => {
     const sql = text.replace(/\s+/g, ' ').trim();
-    if (sql.startsWith('SELECT persona_reel_views_per_like')) {
+    if (sql.startsWith('SELECT cadence_mode,persona_reel_views_per_like')) {
       // 收缩之后这条读**不带任何参数**：一旦有人把选行键加回来，这里会当场断言失败，
       // 而不是悄悄退化成「按某个键选行、选不中就当没有策略」。
       assert.deepEqual(params, [], '全局策略读 MUST NOT 再带任何选行参数');
@@ -232,22 +235,23 @@ function database(options: { executionTarget?: 'dev' | 'ol' } = {}) {
     if (sql.startsWith('UPDATE facebook_operation_global_policy')) {
       globalRow = {
         ...globalRow,
-        persona_reel_views_per_like: Number(params[0]),
-        persona_reel_views_per_follow: Number(params[1]),
-        slow_start_reel_views_per_like: Number(params[2]),
-        slow_start_reel_views_per_follow: Number(params[3]),
-        rule_reel_views_per_follow: Number(params[4]),
-        consumption_reel_views_per_follow: Number(params[5]),
-        rule_views_per_like: Number(params[6]),
-        rule_join_every_n_rounds: Number(params[7]),
-        consumption_views_per_like: Number(params[8]),
-        consumption_confirmed_likes_per_join: Number(params[9]),
-        consumption_confirmed_joins_per_comment: Number(params[10]),
-        slow_start_total_days: Number(params[11]),
-        slow_start_daily_caps: JSON.parse(String(params[12])),
-        revision: Number(params[13]),
+        cadence_mode: String(params[0]),
+        persona_reel_views_per_like: Number(params[1]),
+        persona_reel_views_per_follow: Number(params[2]),
+        slow_start_reel_views_per_like: Number(params[3]),
+        slow_start_reel_views_per_follow: Number(params[4]),
+        rule_reel_views_per_follow: Number(params[5]),
+        consumption_reel_views_per_follow: Number(params[6]),
+        rule_views_per_like: Number(params[7]),
+        rule_join_every_n_rounds: Number(params[8]),
+        consumption_views_per_like: Number(params[9]),
+        consumption_confirmed_likes_per_join: Number(params[10]),
+        consumption_confirmed_joins_per_comment: Number(params[11]),
+        slow_start_total_days: Number(params[12]),
+        slow_start_daily_caps: JSON.parse(String(params[13])),
+        revision: Number(params[14]),
         updated_at: new Date(),
-        updated_by: String(params[14]),
+        updated_by: String(params[15]),
       };
       return { rows: [{ ...globalRow }], rowCount: 1 };
     }
@@ -754,6 +758,71 @@ describe('FacebookOperationPolicyStore', () => {
     );
   });
 
+  it('cadenceMode: 缺省保持现值、写入翻转触发继承环境级联，非法值先拒', async () => {
+    const db = database({ executionTarget: 'dev' });
+    await db.store.init();
+    assert.equal(db.store.getGlobal()?.cadenceMode, 'fixed', '默认 fixed');
+
+    const inherited = await db.store.writeEnvironment(
+      'env-fb',
+      { expectedRevision: 0, mode: 'rule', cadenceSource: 'global', requestId: 'seed' },
+      'panel:alice',
+    );
+    assert.equal(inherited.ok, true);
+    const auditsAfterSeed = db.audits.length;
+
+    // 不带 cadenceMode 的写(旧前端)：模式保持现值,且不因它触发级联(数值也没变 → 无新继承审计)。
+    const keep = await db.store.writeGlobal(
+      {
+        expectedRevision: 1,
+        rule: db.store.getGlobal()!.rule,
+        consumption: db.store.getGlobal()!.consumption,
+        reels: db.store.getGlobal()!.reels,
+        slowStart: db.store.getGlobal()!.slowStart,
+        requestId: 'keep-mode',
+      },
+      'panel:alice',
+    );
+    assert.equal(keep.ok, true);
+    if (keep.ok) assert.equal(keep.view.cadenceMode, 'fixed', '缺省 MUST 保持现值');
+    assert.equal(db.audits.length, auditsAfterSeed, '数值与模式都没变 → 不级联,无新继承审计');
+
+    // 翻转模式:即便所有数值不变,也必须级联继承环境(policy_revision 前进),防旧计数+新判定混跑。
+    const flipped = await db.store.writeGlobal(
+      {
+        expectedRevision: 2,
+        cadenceMode: 'probabilistic',
+        rule: db.store.getGlobal()!.rule,
+        consumption: db.store.getGlobal()!.consumption,
+        reels: db.store.getGlobal()!.reels,
+        slowStart: db.store.getGlobal()!.slowStart,
+        requestId: 'flip-mode',
+      },
+      'panel:alice',
+    );
+    assert.equal(flipped.ok, true);
+    if (flipped.ok) assert.equal(flipped.view.cadenceMode, 'probabilistic');
+    assert.equal(db.audits.length, auditsAfterSeed + 1, '模式翻转 MUST 级联继承环境一条新审计');
+    assert.equal(db.store.getGlobal()?.cadenceMode, 'probabilistic');
+
+    // 非法值先拒:不开事务、不动行、revision 不变。
+    const bad = await db.store.writeGlobal(
+      {
+        expectedRevision: 3,
+        cadenceMode: 'sometimes' as never,
+        rule: db.store.getGlobal()!.rule,
+        consumption: db.store.getGlobal()!.consumption,
+        reels: db.store.getGlobal()!.reels,
+        slowStart: db.store.getGlobal()!.slowStart,
+        requestId: 'bad-mode',
+      },
+      'panel:alice',
+    );
+    assert.equal(bad.ok, false);
+    if (!bad.ok) assert.equal(bad.reason, 'invalid_value');
+    assert.equal(db.store.getGlobal()?.revision, 3, '非法值拒收后 revision 不变');
+  });
+
   it('rejects malformed target-global daily caps before opening a transaction', async () => {
     const db = database({ executionTarget: 'dev' });
     await db.store.init();
@@ -862,6 +931,7 @@ describe('FacebookOperationPolicyStore', () => {
       Object.keys(baseline).sort(),
       [
         'baseMode',
+        'cadenceMode',
         'cadenceSource',
         'consumption',
         'envKey',

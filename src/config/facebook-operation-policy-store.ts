@@ -14,6 +14,8 @@ import {
   cloneFacebookReelCadence,
   resolveFacebookOperationAccountDecision,
   resolveFacebookOperationBase,
+  FACEBOOK_CADENCE_MODES,
+  type FacebookCadenceMode,
   type FacebookEffectiveOperationMode,
   type FacebookOperationPolicyAccountDecision,
   type FacebookSlowStartResolution,
@@ -33,7 +35,7 @@ const { Pool } = pg;
 
 export const FACEBOOK_OPERATION_POLICY_SCHEMA_VERSION = 'facebook_operation_policy@1';
 export const FACEBOOK_OPERATION_GLOBAL_POLICY_SCHEMA_VERSION =
-  'facebook_operation_global_policy@3';
+  'facebook_operation_global_policy@4';
 
 export const FACEBOOK_OPERATION_POLICY_BOUNDS = {
   rule: {
@@ -106,6 +108,7 @@ export type {
   FacebookBaseOperationMode,
   FacebookPrimaryBrowseSurface,
   FacebookCadenceSource,
+  FacebookCadenceMode,
   FacebookRuleOperationParameters,
   FacebookConsumptionOperationParameters,
   FacebookGlobalReelCadenceParameters,
@@ -154,6 +157,8 @@ export interface FacebookOperationGlobalPolicyView {
   executionTarget: DeploymentTarget;
   revision: number;
   schemaVersion: string;
+  /** 节奏解释模式（全局单选,统管全部 N 次 A→1 次 B 数值);fixed=精确计数,probabilistic=逐事件 1/N。 */
+  cadenceMode: FacebookCadenceMode;
   rule: FacebookRuleOperationParameters;
   consumption: FacebookConsumptionOperationParameters;
   reels: FacebookGlobalReelCadenceParameters;
@@ -329,6 +334,7 @@ interface LockedEnvironmentDbRow {
 }
 
 interface GlobalOperationPolicyDbRow {
+  cadence_mode: string;
   persona_reel_views_per_like: number | string;
   persona_reel_views_per_follow: number | string;
   slow_start_reel_views_per_like: number | string;
@@ -410,6 +416,7 @@ const OPERATION_POLICY_REQUIREMENT = {
     ])],
     ['facebook_operation_global_policy', new Set([
       'singleton',
+      'cadence_mode',
       'persona_reel_views_per_like',
       'persona_reel_views_per_follow',
       'slow_start_reel_views_per_like',
@@ -511,6 +518,7 @@ function defaultGlobalPolicy(executionTarget: DeploymentTarget): FacebookOperati
     executionTarget,
     revision: 1,
     schemaVersion: FACEBOOK_OPERATION_GLOBAL_POLICY_SCHEMA_VERSION,
+    cadenceMode: 'fixed',
     rule: {
       viewsPerLike: FACEBOOK_OPERATION_POLICY_BOUNDS.rule.viewsPerLike.default,
       joinEveryNRounds: FACEBOOK_OPERATION_POLICY_BOUNDS.rule.joinEveryNRounds.default,
@@ -614,6 +622,8 @@ function normalizedDailyCaps(
 
 function normalizedGlobalWrite(input: {
   expectedRevision: number;
+  /** 缺省=保持现值(版本偏斜:旧前端不发该键时 MUST NOT 静默翻回 fixed)。 */
+  cadenceMode?: FacebookCadenceMode;
   rule: FacebookRuleOperationParameters;
   consumption: FacebookConsumptionOperationParameters;
   reels: FacebookGlobalReelCadenceParameters;
@@ -626,6 +636,12 @@ function normalizedGlobalWrite(input: {
 }): { ok: true; dailyCaps: FacebookSlowStartDailyCaps[] }
   | { ok: false; reason: 'invalid_value' } {
   if (!Number.isSafeInteger(input.expectedRevision) || input.expectedRevision < 0) {
+    return { ok: false, reason: 'invalid_value' };
+  }
+  if (
+    input.cadenceMode !== undefined
+    && !FACEBOOK_CADENCE_MODES.includes(input.cadenceMode)
+  ) {
     return { ok: false, reason: 'invalid_value' };
   }
   if (
@@ -970,7 +986,7 @@ export class FacebookOperationPolicyStore {
       ),
       this.executionTarget
         ? this.pool.query<GlobalOperationPolicyDbRow>(
-            `SELECT persona_reel_views_per_like,
+            `SELECT cadence_mode,persona_reel_views_per_like,
                     persona_reel_views_per_follow,slow_start_reel_views_per_like,
                     slow_start_reel_views_per_follow,
                     rule_reel_views_per_follow,consumption_reel_views_per_follow,
@@ -1110,6 +1126,8 @@ export class FacebookOperationPolicyStore {
       baseMode: policy.baseMode,
       policyRevision: policy.policyRevision,
       cadenceSource: policy.cadenceSource,
+      // 节奏解释模式是全局单选,不随环境覆盖;镜像基线逐环境带同一份(kernel 校验器认 12 键)。
+      cadenceMode: this.globalPolicy?.cadenceMode ?? 'fixed',
       rule: policy.rule,
       consumption: policy.consumption,
       reels: policy.reels,
@@ -1209,6 +1227,8 @@ export class FacebookOperationPolicyStore {
   async writeGlobal(
     input: {
       expectedRevision: number;
+      /** 缺省=保持现值(版本偏斜:旧前端不发该键时 MUST NOT 静默翻回 fixed)。 */
+      cadenceMode?: FacebookCadenceMode;
       rule: FacebookRuleOperationParameters;
       consumption: FacebookConsumptionOperationParameters;
       reels: FacebookGlobalReelCadenceParameters;
@@ -1232,7 +1252,7 @@ export class FacebookOperationPolicyStore {
     try {
       await client.query('BEGIN');
       const currentResult = await client.query<GlobalOperationPolicyDbRow>(
-        `SELECT persona_reel_views_per_like,
+        `SELECT cadence_mode,persona_reel_views_per_like,
                 persona_reel_views_per_follow,slow_start_reel_views_per_like,
                 slow_start_reel_views_per_follow,
                 rule_reel_views_per_follow,consumption_reel_views_per_follow,
@@ -1266,23 +1286,24 @@ export class FacebookOperationPolicyStore {
       const nextRevision = current.revision + 1;
       const writtenResult = await client.query<GlobalOperationPolicyDbRow>(
         `UPDATE facebook_operation_global_policy
-            SET persona_reel_views_per_like=$1,
-                persona_reel_views_per_follow=$2,
-                slow_start_reel_views_per_like=$3,
-                slow_start_reel_views_per_follow=$4,
-                rule_reel_views_per_follow=$5,
-                consumption_reel_views_per_follow=$6,
-                rule_views_per_like=$7,
-                rule_join_every_n_rounds=$8,
-                consumption_views_per_like=$9,
-                consumption_confirmed_likes_per_join=$10,
-                consumption_confirmed_joins_per_comment=$11,
-                slow_start_total_days=$12,
-                slow_start_daily_caps=$13::jsonb,
-                revision=$14,
+            SET cadence_mode=$1,
+                persona_reel_views_per_like=$2,
+                persona_reel_views_per_follow=$3,
+                slow_start_reel_views_per_like=$4,
+                slow_start_reel_views_per_follow=$5,
+                rule_reel_views_per_follow=$6,
+                consumption_reel_views_per_follow=$7,
+                rule_views_per_like=$8,
+                rule_join_every_n_rounds=$9,
+                consumption_views_per_like=$10,
+                consumption_confirmed_likes_per_join=$11,
+                consumption_confirmed_joins_per_comment=$12,
+                slow_start_total_days=$13,
+                slow_start_daily_caps=$14::jsonb,
+                revision=$15,
                 updated_at=now(),
-                updated_by=$15
-          RETURNING persona_reel_views_per_like,
+                updated_by=$16
+          RETURNING cadence_mode,persona_reel_views_per_like,
                     persona_reel_views_per_follow,slow_start_reel_views_per_like,
                     slow_start_reel_views_per_follow,
                     rule_reel_views_per_follow,consumption_reel_views_per_follow,
@@ -1291,6 +1312,7 @@ export class FacebookOperationPolicyStore {
                     consumption_confirmed_joins_per_comment,slow_start_total_days,
                     slow_start_daily_caps,revision,updated_at,updated_by`,
         [
+          input.cadenceMode ?? current.cadenceMode,
           input.reels.persona.viewsPerLike,
           input.reels.persona.viewsPerFollow,
           input.reels.slowStart.viewsPerLike,
@@ -1331,9 +1353,12 @@ export class FacebookOperationPolicyStore {
         ],
       );
 
+      // 模式翻转也算节奏变更：继承环境的 policy_revision 必须前进,运行时快照按既有
+      // mismatch 机制重置——否则「旧模式计数 + 新模式判定」在同一 revision 下混跑。
       const cadenceChanged =
         JSON.stringify(current.rule) !== JSON.stringify(next.rule)
-        || JSON.stringify(current.consumption) !== JSON.stringify(next.consumption);
+        || JSON.stringify(current.consumption) !== JSON.stringify(next.consumption)
+        || current.cadenceMode !== next.cadenceMode;
       if (cadenceChanged) {
         const inherited = await client.query<OperationPolicyDbRow>(
           `SELECT env_key,base_mode,rule_views_per_like,rule_join_every_n_rounds,
@@ -2588,6 +2613,10 @@ export class FacebookOperationPolicyStore {
     const totalDays = Number(row.slow_start_total_days);
     const dailyCaps = normalizedDailyCaps(row.slow_start_daily_caps, totalDays);
     if (!dailyCaps) throw new Error('facebook_operation_global_policy_invalid_daily_caps');
+    const cadenceMode = row.cadence_mode as FacebookCadenceMode;
+    if (!FACEBOOK_CADENCE_MODES.includes(cadenceMode)) {
+      throw new Error('facebook_operation_global_policy_invalid_cadence_mode');
+    }
     return {
       // **这个字段现在表示「你正在通过哪个目标的接口读这份配置」，不再表示「这份配置属于谁」**
       // （change unify-facebook-global-policy-across-targets）：策略已收成跨目标唯一一份，
@@ -2599,6 +2628,7 @@ export class FacebookOperationPolicyStore {
       executionTarget: this.executionTarget ?? 'dev',
       revision: Number(row.revision),
       schemaVersion: FACEBOOK_OPERATION_GLOBAL_POLICY_SCHEMA_VERSION,
+      cadenceMode,
       rule: {
         viewsPerLike: Number(row.rule_views_per_like),
         joinEveryNRounds: Number(row.rule_join_every_n_rounds),
@@ -2651,6 +2681,7 @@ export class FacebookOperationPolicyStore {
   ): Record<string, unknown> {
     return {
       executionTarget: policy.executionTarget,
+      cadenceMode: policy.cadenceMode,
       rule: policy.rule,
       consumption: policy.consumption,
       reels: policy.reels,

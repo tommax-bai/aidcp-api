@@ -1176,8 +1176,13 @@ function createRequestHandler(
           'consumption',
           'reels',
           'slowStart',
+          // cadenceMode 可选(版本偏斜:旧前端不发;缺省=保持现值,由 store 落实)。
+          ...('cadenceMode' in body ? ['cadenceMode'] : []),
           ...('reason' in body ? ['reason'] : []),
         ])
+        || ('cadenceMode' in body
+          && body.cadenceMode !== 'fixed'
+          && body.cadenceMode !== 'probabilistic')
         || !Number.isInteger(body.expectedRevision)
         || !isRecord(body.rule)
         || !hasExactlyKeys(body.rule, ['viewsPerLike', 'joinEveryNRounds'])
@@ -1245,6 +1250,9 @@ function createRequestHandler(
             }>;
           },
           requestId: randomUUID(),
+          ...(body.cadenceMode === 'fixed' || body.cadenceMode === 'probabilistic'
+            ? { cadenceMode: body.cadenceMode }
+            : {}),
           ...(typeof body.reason === 'string' ? { reason: body.reason } : {}),
         },
         `panel:${verified.payload.sub}`,
